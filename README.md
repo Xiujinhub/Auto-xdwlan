@@ -15,7 +15,7 @@ E:\code\Auto-xdwlan\
 │   ├─ Auto-xdwlan.png      logo 原图
 │   ├─ Auto-xdwlan.ico      程序/托盘图标（多尺寸）
 │   └─ logo_192.png         界面里显示的 logo 小图
-├─ autoconn_README.md       本文件
+├─ README.md                本文件（文件清单 / 核心功能 / 核心逻辑 / 排查）
 ├─ .gitignore               提交时忽略 settings.json / dist / build / __pycache__（密码不进仓库）
 └─ settings.json            界面保存的账号与设置（首次「保存配置」后自动生成）
 ```
