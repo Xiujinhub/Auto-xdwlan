@@ -16,6 +16,7 @@ E:\code\Auto-xdwlan\
 │   ├─ Auto-xdwlan.ico      程序/托盘图标（多尺寸）
 │   └─ logo_192.png         界面里显示的 logo 小图
 ├─ autoconn_README.md       本文件
+├─ .gitignore               提交时忽略 settings.json / dist / build / __pycache__（密码不进仓库）
 └─ settings.json            界面保存的账号与设置（首次「保存配置」后自动生成）
 ```
 
@@ -201,4 +202,9 @@ for attempt in 1..MAX_RETRY(20):
   功能有重叠（都会做 Portal 认证），同时开可能重复登录，但不会互相破坏。
 * `dist\Auto-xdwlan.exe` 就是最新版；可以整个拷到别处用（配置跟着 exe 走），
   移动后记得重新勾一次「开机自启动」。
+* **远程仓库**：<https://github.com/Xiujinhub/Auto-xdwlan>。`settings.json`（含账号密码）已加入
+  `.gitignore`，不会被上传；`autoconn.py` 里的 `USERNAME/PASSWORD` 也留空，账号密码只存在本机。
+* 这台电脑的 hosts 把 github.com 屏蔽成了 `127.0.0.1`，所以仓库里配了代理：
+  `git config --local http.proxy http://127.0.0.1:7890`（Clash 端口）、`http.schannelCheckRevoke false`。
+  换网络/关代理后想取消：`git config --local --unset http.proxy`。
 
