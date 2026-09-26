@@ -50,6 +50,25 @@ except Exception:  # pragma: no cover
     pass
 
 
+# ---------- 网络请求：一律直连，不走系统代理 ----------
+# 本机开着 Clash / VPN 等系统代理时，校园网请求必须绕过代理：
+# requests 默认会读取系统（注册表）代理，代理一旦关闭或异常，
+# Portal 与外网探测就会全部失败（表现为「连不上、一直重试」）。
+NO_PROXY = {'http': None, 'https': None, 'ftp': None}
+
+
+def new_session():
+    """新建一个忽略系统代理的 requests.Session（trust_env=False）。"""
+    session = requests.Session()
+    session.trust_env = False           # 忽略 HTTP_PROXY/系统代理
+    session.proxies = dict(NO_PROXY)    # 显式声明该会话不用代理
+    return session
+
+
+# 界面版点「停止」时会把它置为 True，让重试/等待循环尽快退出
+STOP_REQUESTED = False
+
+
 # ---------- 读取界面版保存的私有配置（settings.json，不会被提交到仓库） ----------
 
 _OBF_KEY = b'Auto-xdwlan-2024'      # 与界面版 app.py 一致
@@ -319,11 +338,13 @@ def _api_get(session, path, params, use_ssl=True):
     debug('GET %s %s' % (url, json.dumps(query, ensure_ascii=False)))
     try:
         response = session.get(url, params=query, headers=HEADERS,
-                               timeout=REQUEST_TIMEOUT, verify=True)
+                               timeout=REQUEST_TIMEOUT, verify=True,
+                               proxies=NO_PROXY)
     except requests.exceptions.SSLError:
         debug('HTTPS 证书校验失败，改为不校验证书重试')
         response = session.get(url, params=query, headers=HEADERS,
-                               timeout=REQUEST_TIMEOUT, verify=False)
+                               timeout=REQUEST_TIMEOUT, verify=False,
+                               proxies=NO_PROXY)
     except requests.exceptions.ConnectionError:
         if use_ssl:
             debug('HTTPS 连不上，换 HTTP 再试一次')
@@ -375,7 +396,7 @@ def check_internet():
     for url, expect_status in INTERNET_PROBES:
         try:
             response = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT,
-                                    allow_redirects=False)
+                                    allow_redirects=False, proxies=NO_PROXY)
         except requests.exceptions.RequestException as error:
             debug('外网探测 %s 失败: %s' % (url, error))
             continue
@@ -407,7 +428,7 @@ def portal_reachable(timeout=None):
         response = requests.get(PORTAL + '/cgi-bin/get_challenge',
                                 params={'username': USERNAME + DOMAIN, 'ip': '',
                                         'callback': 'jQuery1', '_': str(int(time.time()))},
-                                headers=HEADERS,
+                                headers=HEADERS, proxies=NO_PROXY,
                                 timeout=timeout or REQUEST_TIMEOUT)
         return response.status_code == 200
     except requests.exceptions.RequestException as error:
@@ -454,7 +475,7 @@ def build_login_params(token, ip, challenge_ip=''):
 
 def login(ip=''):
     """执行一次完整登录：取 token -> 提交认证。返回 (是否成功, 说明)。"""
-    session = requests.Session()
+    session = new_session()
     try:
         challenge = get_challenge(session, ip)
     except Exception as error:
@@ -504,7 +525,7 @@ def _explain_error(result):
 
 def logout(ip=''):
     """注销当前 IP 的登录（把网断掉，用于验证脚本真的生效）。"""
-    session = requests.Session()
+    session = new_session()
     try:
         challenge = get_challenge(session, ip)
         auth_ip = ip or str(challenge.get('client_ip') or '')
@@ -527,7 +548,7 @@ def kick_session(ip=''):
     实测：当本机 IP 上残留了状态异常的旧会话时，普通 action=logout 不一定有效，
     而 rad_user_dm 能把会话真正踢掉，随后登录就会返回 login_ok。
     """
-    session = requests.Session()
+    session = new_session()
     target = ip
     if not target:
         info = get_online_info(session)
@@ -1073,6 +1094,8 @@ def wait_for_network(max_wait=90):
     """开机后网卡/网关可能还没就绪，等一下再动手。"""
     waited = 0
     while waited < max_wait:
+        if STOP_REQUESTED:
+            return False
         if portal_reachable(timeout=5):
             return True
         if waited == 0:
@@ -1119,7 +1142,7 @@ def ensure_pppoe():
 
 def auto_connect():
     """核心逻辑：能上外网就退出；否则登录，失败就按间隔重试。"""
-    session = requests.Session()
+    session = new_session()
     online_user = who_is_online(session)
     if online_user:
         log('Portal 记录显示 %s 已在线' % online_user)
@@ -1128,6 +1151,9 @@ def auto_connect():
     already_online = 0
     pppoe_done = False
     for attempt in range(1, MAX_RETRY + 1):
+        if STOP_REQUESTED:
+            log('已按请求停止本次连接（界面里点了「停止」）')
+            return 1
         connected, detail = check_internet()
         if connected:
             log('网络已连通（%s），第 %d 次检查，无需登录' % (detail, attempt))
@@ -1171,7 +1197,7 @@ def auto_connect():
             log('第 %d 次登录失败：%s' % (attempt, message))
 
         # 账号/本机 IP 已有旧会话导致登录被拒时，先清理旧会话再重试
-        if not kicked and who_is_online(requests.Session()):
+        if not kicked and who_is_online(new_session()):
             debug('检测到旧会话，先强制下线再重试')
             kicked = True
             ok, message = clear_stale_session()
@@ -1227,7 +1253,7 @@ def main(argv=None):
                if entries else '无'))
         connected, detail = check_internet()
         log('外网连通: %s（%s）' % (connected, detail))
-        online_user = who_is_online(requests.Session())
+        online_user = who_is_online(new_session())
         log('Portal 在线账号: %s' % (online_user or '未查询到（未登录）'))
         return 0 if connected else 1
 

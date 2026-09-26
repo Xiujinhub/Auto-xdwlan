@@ -173,8 +173,8 @@ def apply_settings(data):
     autoconn.PPPOE_NAME = (data.get('pppoe_name') or '').strip() or 'XidianPPoE'
     autoconn.PPPOE_USER = ''
     autoconn.PPPOE_PASSWORD = ''
-    autoconn.MAX_RETRY = 18
-    autoconn.RETRY_INTERVAL = 10
+    autoconn.MAX_RETRY = 8       # 界面里不要长时间卡着（配合「停止」按钮）
+    autoconn.RETRY_INTERVAL = 8
     autoconn.REQUEST_TIMEOUT = 8
     autoconn.LOG_FILE = None  # 不写日志文件
 
@@ -260,7 +260,7 @@ def job_check():
     online_user = ''
     try:
         if connected or autoconn.portal_reachable(timeout=5):
-            online_user = autoconn.who_is_online(autoconn.requests.Session()) or ''
+            online_user = autoconn.who_is_online(autoconn.new_session()) or ''
     except Exception:
         online_user = ''
     info['user'] = online_user
@@ -714,6 +714,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.disconnect_btn.setToolTip('注销校园网登录并断开拨号')
         self.disconnect_btn.clicked.connect(lambda: self.start_job('disconnect'))
         buttons.addWidget(self.disconnect_btn)
+
+        self.stop_btn = QtWidgets.QPushButton('停止')
+        self.stop_btn.setObjectName('Ghost')
+        self.stop_btn.setCursor(QtCore.Qt.PointingHandCursor)
+        self.stop_btn.setToolTip('中止正在进行的连接 / 检测任务')
+        self.stop_btn.setEnabled(False)
+        self.stop_btn.clicked.connect(self.stop_job)
+        buttons.addWidget(self.stop_btn)
         card.body.addLayout(buttons)
         return card
 
@@ -938,8 +946,10 @@ class MainWindow(QtWidgets.QMainWindow):
         for button in (self.connect_btn, self.refresh_btn,
                        self.disconnect_btn, self.save_btn):
             button.setEnabled(not busy)
+        self.stop_btn.setEnabled(busy)
         if not busy:
             return
+        self.hint.setText('任务进行中，可点「停止」中止')
         self._paint_dot(C_ACCENT)
         if job_name == 'connect':
             self.status_text.setText('正在连接…')
@@ -970,14 +980,25 @@ class MainWindow(QtWidgets.QMainWindow):
             self.tray.showMessage(APP_NAME, message,
                                   QtWidgets.QSystemTrayIcon.Warning, 4000)
             return False
+        autoconn.STOP_REQUESTED = False
         apply_settings(self.collect_settings())
         self.set_busy(True, job_name)
         if notify:
-            self.hint.setText('已发起「%s」' % JOB_TITLES.get(job_name, job_name))
+            self.hint.setText('已发起「%s」，可点「停止」中止'
+                              % JOB_TITLES.get(job_name, job_name))
         self.worker = Worker(job_name, self)
         self.worker.finished_job.connect(self.on_job_done)
         self.worker.start()
         return True
+
+    def stop_job(self):
+        """中止正在进行的任务：置停止标记，工作线程会在下一次检查时退出。"""
+        if not self.busy:
+            return
+        autoconn.STOP_REQUESTED = True
+        self.stop_btn.setEnabled(False)
+        self.hint.setText('正在停止…（等当前这一步结束）')
+        log_line('已请求停止当前任务…')
 
     def on_job_done(self, job_name, ok, info):
         worker = self.worker
@@ -985,6 +1006,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if worker is not None:
             worker.deleteLater()
         self.set_busy(False, job_name)
+        autoconn.STOP_REQUESTED = False
         self._run_pending_job()
         if job_name == 'check':
             self.update_status(info)
