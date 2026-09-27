@@ -5,7 +5,8 @@
 .DESCRIPTION
     1) 从 logo\Auto-xdwlan.png 生成 logo\Auto-xdwlan.ico（如果还没有）
     2) 用 PyInstaller 打包成 dist\Auto-xdwlan.exe（单文件、无控制台窗口）
-    3) exe 运行后只在同目录生成配置文件 settings.json（不写日志文件，日志只显示在窗口里）
+    3) exe 运行后只在同目录生成配置文件 settings.json（运行日志只显示在窗口里，不写日志文件；
+       只有内部异常才会追加 crash.log）
 
 .PARAMETER Python
     Python 解释器路径（需要已经安装 PyQt5 / requests / pyinstaller）。

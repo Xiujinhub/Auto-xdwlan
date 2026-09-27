@@ -24,6 +24,7 @@ import json
 import os
 import sys
 import time
+import traceback
 
 from PyQt5 import QtCore, QtGui, QtNetwork, QtWidgets
 
@@ -31,7 +32,7 @@ import autoconn
 
 APP_NAME = 'Auto-xdwlan'
 APP_TITLE = '西电校园网自动连接'
-APP_VERSION = '2.0'
+APP_VERSION = '2.1'
 SETTINGS_FILE = 'settings.json'
 LOCAL_SERVER = 'Auto-xdwlan-gui'
 
@@ -86,6 +87,76 @@ def log_line(message, also_print=True):
     """替换 autoconn 的日志函数：只推送到界面，不写任何日志文件。"""
     stamp = time.strftime('%Y-%m-%d %H:%M:%S')
     LOG_BUS.message.emit('[%s] %s' % (stamp[11:], message))
+
+
+# ============================== 崩溃保护 ==============================
+#
+# 为什么需要这段？PyQt5（5.5 起）对「槽函数 / 定时器回调里未捕获的 Python 异常」
+# 的默认处理是 qFatal() —— 直接 abort() 掉整个进程（Windows 上表现为
+# 0xC0000409 / ucrtbase.dll 的静默崩溃，窗口凭空消失，没有任何提示）。
+# 装上 sys.excepthook 后，异常会被我们自己接住并写进 crash.log，程序继续运行。
+
+CRASH_LOG = os.path.join(app_dir(), 'crash.log')
+
+
+class CrashBus(QtCore.QObject):
+    """把任意线程里的异常信息转发到界面线程。"""
+
+    message = QtCore.pyqtSignal(str)
+
+
+CRASH_BUS = CrashBus()
+
+
+def write_crash_log(text):
+    """追加写 crash.log（超过 256 KB 就滚动成 crash.log.old）。"""
+    try:
+        if os.path.exists(CRASH_LOG) and os.path.getsize(CRASH_LOG) > 256 * 1024:
+            try:
+                os.remove(CRASH_LOG + '.old')
+            except OSError:
+                pass
+            os.replace(CRASH_LOG, CRASH_LOG + '.old')
+        with open(CRASH_LOG, 'a', encoding='utf-8') as handle:
+            handle.write(text)
+    except Exception:
+        pass
+
+
+def _excepthook(exc_type, exc_value, exc_tb):
+    """兜底异常处理：记录 + 提示，绝不 re-raise（否则 PyQt 会 abort 进程）。"""
+    header = '[%s] 未捕获异常（已忽略，程序继续运行）\n' % time.strftime('%Y-%m-%d %H:%M:%S')
+    try:
+        detail = ''.join(traceback.format_exception(exc_type, exc_value, exc_tb))
+    except Exception:
+        detail = '%s: %s\n' % (exc_type, exc_value)
+    write_crash_log(header + detail + '\n')
+    try:
+        CRASH_BUS.message.emit(header + detail)
+    except Exception:
+        pass
+
+
+def install_excepthook():
+    """接管未捕获异常，避免 PyQt5 qFatal() 把程序直接干掉。"""
+    sys.excepthook = _excepthook
+
+
+def retire_worker(worker):
+    """安全回收工作线程：等线程真正结束后再 deleteLater。
+
+    直接在线程自己的信号槽里 deleteLater，有可能在线程还没结束时就
+    析构 QThread，Qt 会 qFatal('QThread: Destroyed while thread is still
+    running') 直接 abort 掉进程，所以统一走这里。
+    """
+    if worker is None:
+        return
+    try:
+        worker.finished.connect(worker.deleteLater)
+        if worker.isFinished():
+            worker.deleteLater()
+    except Exception:
+        pass
 
 
 # ============================== 配置读写 ==============================
@@ -889,9 +960,27 @@ class MainWindow(QtWidgets.QMainWindow):
     # ---------- 日志 / 状态显示 ----------
 
     def append_log(self, line):
-        self.log_view.appendPlainText(line)
-        scrollbar = self.log_view.verticalScrollBar()
-        scrollbar.setValue(scrollbar.maximum())
+        try:
+            self.log_view.appendPlainText(line)
+            scrollbar = self.log_view.verticalScrollBar()
+            scrollbar.setValue(scrollbar.maximum())
+        except Exception:
+            pass
+
+    def on_crash(self, detail):
+        """界面线程里处理被兜底的内部异常：提示 + 托盘气泡，程序不退出。"""
+        lines = [text for text in detail.strip().splitlines() if text.strip()]
+        summary = lines[-1] if lines else '未知错误'
+        try:
+            log_line('内部异常已被兜底（详情见 crash.log）：%s' % summary)
+            self.hint.setText('内部异常已记入 crash.log，程序继续运行')
+        except Exception:
+            pass
+        try:
+            self.tray.showMessage(APP_NAME, '程序内部异常，已记入 crash.log',
+                                  QtWidgets.QSystemTrayIcon.Warning, 4000)
+        except Exception:
+            pass
 
     def _paint_dot(self, color):
         self.dot.setStyleSheet('background-color: %s; border-radius: 9px;' % color)
@@ -986,6 +1075,9 @@ class MainWindow(QtWidgets.QMainWindow):
         if notify:
             self.hint.setText('已发起「%s」，可点「停止」中止'
                               % JOB_TITLES.get(job_name, job_name))
+        if self.worker is not None:
+            # 理论上走不到这里（busy 已经挡住并发任务）；真发生了也不能直接丢掉引用
+            retire_worker(self.worker)
         self.worker = Worker(job_name, self)
         self.worker.finished_job.connect(self.on_job_done)
         self.worker.start()
@@ -1003,8 +1095,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def on_job_done(self, job_name, ok, info):
         worker = self.worker
         self.worker = None
-        if worker is not None:
-            worker.deleteLater()
+        retire_worker(worker)
         self.set_busy(False, job_name)
         autoconn.STOP_REQUESTED = False
         self._run_pending_job()
@@ -1156,6 +1247,9 @@ def main(argv=None):
     if sys.stderr is None:
         sys.stderr = open(os.devnull, 'w')
 
+    # 兜住未捕获异常：PyQt5 默认会 qFatal() 直接 abort 掉进程（旧版「自己关闭」的元凶）
+    install_excepthook()
+
     QtWidgets.QApplication.setAttribute(QtCore.Qt.AA_EnableHighDpiScaling, True)
     QtWidgets.QApplication.setAttribute(QtCore.Qt.AA_UseHighDpiPixmaps, True)
     app = QtWidgets.QApplication(argv)
@@ -1175,6 +1269,7 @@ def main(argv=None):
         return 0
 
     window = MainWindow(tray_only=tray_only)
+    CRASH_BUS.message.connect(window.on_crash)
     guard.activated.connect(window.show_window)
     if not tray_only:
         window.show()
