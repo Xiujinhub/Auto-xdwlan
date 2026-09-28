@@ -129,6 +129,15 @@ DEVICE_NAME = 'Windows'     # 对应前端 name 参数
 MAX_RETRY = 20
 RETRY_INTERVAL = 15
 
+# ---------- 断开后重连时「清旧会话」的力度 ----------
+# 断网（拔网线 / 掉线 / 主动断开）后，账号在 NAS 上残留的在线会话会让 Portal 直接
+# 返回 err_code=2「已有在线会话」，本机就再也登不上去。脚本会先查账号的在线设备列表
+# （Portal 的「在线设备管理」接口），把挡路的会话注销掉：
+#   True  = 先清本机自己的旧会话；外网仍不通，就把账号上其它在线设备也一起注销
+#           （等效于在 zfw.xidian.edu.cn 里逐个踢设备），保证本机这次能登上去
+#   False = 只清「看起来是本机」的会话（本机网卡 IP 对得上，或 OS / 客户端名对得上）
+CLEAR_OTHER_DEVICES = True
+
 # ---------- 无线网络（Wi-Fi）自动连接 ----------
 # 脚本发现"Portal 不可达"时会自动去找并连接这个 SSID，然后继续认证
 WIFI_SSID = 'stu-xdwlan'   # 西电学生无线网；不想让脚本动 Wi-Fi 就设成 ''
@@ -239,6 +248,11 @@ def hmac_md5_hex(password, token):
 def sha1_hex(text):
     """对应前端 sha1(str)。"""
     return hashlib.sha1(text.encode('utf-8')).hexdigest()
+
+
+def md5_hex(text):
+    """对应前端 md5(str)：普通 MD5 十六进制（取「在线设备」列表时要用 md5(密码)）。"""
+    return hashlib.md5(text.encode('utf-8')).hexdigest()
 
 
 def srun_base64(raw):
@@ -603,13 +617,161 @@ def kick_session(ip=''):
     return False, '强制下线未成功: %s' % _explain_error(result)
 
 
-def clear_stale_session():
-    """清理旧会话：先试设备下线，再退回普通注销。"""
-    ok, message = kick_session()
-    if ok:
-        return True, message
-    ok2, message2 = logout()
-    return ok2, '%s / %s' % (message, message2)
+def online_sessions(session=None):
+    """列出该账号当前的所有在线会话：[{ip, os_name, class_name, add_time}, ...]。
+
+    两条路（前一条不通就退到下一条）：
+      1. Portal 门户网页上「在线设备管理」用的接口
+         `/v1/srun_portal_online?user_name=账号&password=md5(密码)`，
+         账号在每个 IP 上的会话都能看到（和手动去 zfw.xidian.edu.cn 踢设备看到的一样）；
+      2. 退回 `rad_user_info`：对本机各个 IP 逐个查，响应里的 `online_device_detail`
+         就是账号的全部会话（要求其中某个 IP 正好在线，所以只在第 1 条失败时兜底）。
+    """
+    session = session or new_session()
+    sessions = _portal_online_sessions(session) or _rad_online_sessions(session)
+    # 同一个 IP 上会挂好几条会话（每条链路一条），按 IP 去重：注销时一个 IP 一次就够
+    unique = {}
+    for item in sessions:
+        unique.setdefault(item['ip'], item)
+    return list(unique.values())
+
+
+def _portal_online_sessions(session):
+    """按 Portal 的「在线设备管理」接口取会话列表；取不到返回 []。"""
+    if not USERNAME or not PASSWORD:
+        debug('没有账号/密码，跳过在线设备列表接口')
+        return []
+    try:
+        result = _api_get(session, '/v1/srun_portal_online', {
+            'user_name': USERNAME + DOMAIN,
+            'password': md5_hex(PASSWORD),
+        })
+    except Exception as error:
+        debug('在线设备列表请求失败: %s' % error)
+        return []
+    rows = result.get('data') if isinstance(result, dict) else None
+    if not isinstance(rows, list):
+        debug('在线设备列表返回异常: %s' % str(result)[:200])
+        return []
+    sessions = []
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        ip = str(item.get('ip') or '').strip()
+        if not ip:
+            continue
+        sessions.append({
+            'ip': ip,
+            'os_name': str(item.get('os_name') or ''),
+            'class_name': '',            # 这个接口不给客户端名字，只有 OS
+            'add_time': str(item.get('add_time') or ''),
+        })
+    return sessions
+
+
+def _rad_online_sessions(session):
+    """兜底：用 rad_user_info(+online_device_detail) 拼出会话列表（去重）。"""
+    found = {}
+    candidates = ['']
+    for ip in local_ipv4_addresses():
+        if ip not in candidates:
+            candidates.append(ip)
+    for ip in candidates:
+        try:
+            info = _api_get(session, '/cgi-bin/rad_user_info', {'ip': ip})
+        except Exception as error:
+            debug('rad_user_info(%s) 查询失败: %s' % (ip or '本机', error))
+            continue
+        if str(info.get('error')) != 'ok':
+            continue
+        if str(info.get('user_name') or '').lower() != (USERNAME + DOMAIN).lower():
+            continue        # 这个 IP 上在线的是别的账号，不能动
+        detail = info.get('online_device_detail')
+        if isinstance(detail, str):
+            try:
+                detail = json.loads(detail)
+            except ValueError:
+                detail = None
+        if not isinstance(detail, dict):
+            continue
+        for entry in detail.values():
+            if not isinstance(entry, dict):
+                continue
+            target = str(entry.get('ip') or '').strip()
+            if not target:
+                continue
+            found[target] = {
+                'ip': target,
+                'os_name': str(entry.get('os_name') or ''),
+                'class_name': str(entry.get('class_name') or ''),
+                'add_time': '',
+            }
+    return list(found.values())
+
+
+def _looks_like_ours(item, local_ips):
+    """这个在线会话是不是本机自己留下的。
+
+    * 网卡 IP 对得上 → 肯定是本机（当前或刚用过的 IP）；
+    * 客户端名(class_name)和 OS 名都对得上（rad_user_info 里有 class_name）→ 本机；
+    * `/v1/srun_portal_online` 只返回 OS 名，OS 名对得上就当作「像是本机」
+      （同一个账号在另一台 Windows 10 上登录也会被算进来，所以实在不想动别人时
+      把 CLEAR_OTHER_DEVICES 设成 False 也要接受这个误差；默认 True，本来就都会清）。
+    """
+    if item['ip'] in local_ips:
+        return True
+    if item.get('os_name') != DEVICE_OS:
+        return False
+    return item.get('class_name') in ('', DEVICE_NAME)
+
+
+def clear_stale_sessions():
+    """清掉挡着本机登录的旧会话：本机自己的优先，必要时连账号上其它在线设备一起清。
+
+    背景：`err_code=2` = 账号上已经有在线会话，Portal 就会拒绝新的登录；而这个会话
+    往往不是本机当前的 IP（例如网线拨号断掉后会话还留在 NAS 上、本机换成了别的 IP），
+    所以不能只看本机 IP，得按「在线设备」列表逐个注销（等价于在门户里踢设备）。
+
+    返回 (是否清掉了至少一个, 说明)。
+    """
+    sessions = online_sessions()
+    if not sessions:
+        # 列表都拿不到，就退回老办法：对着本机当前 IP 先设备下线、再普通注销
+        ok, message = kick_session()
+        if not ok:
+            ok2, message2 = logout()
+            ok = ok2
+            message = '%s / %s' % (message, message2)
+        return ok, message
+
+    local_ips = set(local_ipv4_addresses())
+    mine = [item for item in sessions if _looks_like_ours(item, local_ips)]
+    others = [item for item in sessions if item not in mine]
+    if mine:
+        log('本机残留的旧会话：%s' % '、'.join(item['ip'] for item in mine))
+    if others:
+        if CLEAR_OTHER_DEVICES:
+            log('账号上还有其它在线设备，一并注销（不想这样就把 CLEAR_OTHER_DEVICES 设成 False）：%s'
+                % '、'.join(item['ip'] for item in others))
+        else:
+            log('账号上还有其它在线设备（按配置不动它们）：%s'
+                % '、'.join(item['ip'] for item in others))
+
+    results = []
+    cleared = False
+    for item in (mine + others if CLEAR_OTHER_DEVICES else mine):
+        ip = item['ip']
+        ok, message = kick_session(ip)
+        if not ok:
+            ok2, message2 = logout(ip)
+            ok = ok2
+            message = '%s / %s' % (message, message2)
+        cleared = cleared or ok
+        results.append('%s %s' % (ip, '已注销' if ok else '没清掉（%s）' % message))
+        time.sleep(1)
+    if not results:
+        return False, '账号上没有查到需要清理的在线会话'
+    return cleared, '；'.join(results)
 
 
 # ============================== 无线网络（Wi-Fi） ==============================
@@ -906,6 +1068,18 @@ def ethernet_has_ipv4():
     return False
 
 
+def local_ipv4_addresses():
+    """本机所有网卡（含有线 / 无线 / 拨号）的 IPv4，用来认出本机自己留下的旧会话。"""
+    script = ("Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue | "
+              "Where-Object { $_.IPAddress -notlike '127.*' -and "
+              "$_.IPAddress -notlike '169.254.*' } | "
+              "Select-Object -ExpandProperty IPAddress | ConvertTo-Json -Compress")
+    data = _powershell_json(script)
+    if isinstance(data, str):
+        data = [data]
+    return [str(item).strip() for item in (data or []) if str(item).strip()]
+
+
 def _read_text_file(path):
     """读取可能不是 UTF-8 的文本文件（拨号本可能是 ANSI 或 UTF-8）。"""
     try:
@@ -1171,6 +1345,28 @@ def ensure_pppoe():
     return ok, message
 
 
+def recover_link(attempt=1, dial=True):
+    """断网后重新建立链路：先网线拨号（PPPoE），还不行再连 Wi-Fi。返回是否已能上网。
+
+    dial=False 时只做 Wi-Fi 那一步（拨号已经试过，不用重复拨）。
+    """
+    if dial and PPPOE_ENABLE:
+        ok, _ = ensure_pppoe()
+        if ok:
+            time.sleep(3)
+            connected, detail = check_internet()
+            if connected:
+                log('网线拨号后已能上网（%s），无需 Portal 认证' % detail)
+                return True
+    if not portal_reachable(timeout=5):
+        ensure_wifi(wait=WIFI_CONNECT_WAIT if attempt == 1 else 15)
+        wait_for_network(max_wait=WIFI_CONNECT_WAIT)
+    connected, detail = check_internet()
+    if connected:
+        log('接入网络后已能上网（%s）' % detail)
+    return connected
+
+
 def auto_connect():
     """核心逻辑：能上外网就退出；否则登录，失败就按间隔重试。"""
     session = new_session()
@@ -1179,6 +1375,7 @@ def auto_connect():
         log('Portal 记录显示 %s 已在线' % online_user)
 
     kicked = False
+    link_recovered = False
     already_online = 0
     pppoe_done = False
     for attempt in range(1, MAX_RETRY + 1):
@@ -1191,19 +1388,12 @@ def auto_connect():
             return 0
 
         # Portal 不可达通常意味着链路层没通：先试网线拨号，再试 Wi-Fi
+        # （拨号整个流程只做一次，Wi-Fi 每轮都可以再试）
         if not portal_reachable(timeout=5):
-            if not pppoe_done and PPPOE_ENABLE:
-                pppoe_done = True
-                ok, _ = ensure_pppoe()
-                if ok:
-                    time.sleep(3)
-                    connected, detail = check_internet()
-                    if connected:
-                        log('网线拨号后已能上网（%s），无需 Portal 认证' % detail)
-                        return 0
-            if not portal_reachable(timeout=5):
-                ensure_wifi(wait=WIFI_CONNECT_WAIT if attempt == 1 else 15)
-                wait_for_network(max_wait=WIFI_CONNECT_WAIT)
+            dial = not pppoe_done and PPPOE_ENABLE
+            pppoe_done = pppoe_done or dial
+            if recover_link(attempt, dial=dial):
+                return 0
         elif attempt == 1:
             wait_for_network()
 
@@ -1227,9 +1417,12 @@ def auto_connect():
         else:
             log('第 %d 次登录失败：%s' % (attempt, message))
 
-        # 「已有在线会话」类失败要分两种情况处理：
-        #   * 外网已经通了（例如网线拨号 PPPoE 已经在线）→ 按成功处理，绝不踢会话；
-        #   * 外网确实不通 → 才算旧会话残留，清掉旧会话再重试。
+        # 「已有在线会话」类失败要分三种情况处理：
+        #   * 外网已经通了（例如网线拨号 PPPoE 正好恢复了）→ 按成功处理，绝不踢会话；
+        #   * 外网不通，但本机的链路是断的（拨号掉线 / 没连 Wi-Fi）→ 先把链路接回来，
+        #     断网测试时最常见的就是这一种：Portal 能到（校园网里哪都到得了它），
+        #     可网线拨号已经掉线，这时候光重试 Portal 认证永远登不上去；
+        #   * 链路没问题还是被拒 → 是账号上残留的旧会话挡着，把它们注销掉再重登。
         conflict = any(key in message for key in
                        ('code=2', '已在线', 'ip_already_online', '旧会话'))
         if conflict:
@@ -1237,16 +1430,24 @@ def auto_connect():
             if connected:
                 log('Portal 提示已有在线会话，但外网已恢复（%s），按成功处理' % detail)
                 return 0
-            if not kicked and who_is_online(new_session()):
-                debug('外网不通且存在旧会话，先强制下线再重试')
-                kicked = True
-                _, kick_message = clear_stale_session()
-                log('清理旧会话：%s' % kick_message)
-                time.sleep(3)
-                connected, detail = check_internet()
-                if connected:
-                    log('清理旧会话后已能上网（%s）' % detail)
+            if not link_recovered:
+                link_recovered = True
+                dial = not pppoe_done and PPPOE_ENABLE
+                pppoe_done = pppoe_done or dial
+                if recover_link(attempt, dial=dial):
                     return 0
+            if not kicked:
+                kicked = True
+                cleared, kick_message = clear_stale_sessions()
+                log('清理旧会话：%s' % kick_message)
+                if cleared:
+                    # 会话刚清掉，不用再等 RETRY_INTERVAL，立刻重登一次
+                    time.sleep(3)
+                    connected, detail = check_internet()
+                    if connected:
+                        log('清理旧会话后已能上网（%s）' % detail)
+                        return 0
+                    continue
 
         if attempt < MAX_RETRY:
             time.sleep(RETRY_INTERVAL)

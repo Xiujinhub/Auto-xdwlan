@@ -66,8 +66,13 @@ E:\code\Auto-xdwlan\
 3. 成功判定：error == 'ok' 或 res == 'ok'（'ip_already_online_error' 也算成功）；
    `err_code=2`（**原文是 `INFO Error锛宔rr_code=2`** —— 中文逗号被 Portal 按 GBK 重编码，
    把 `err_code` 的 `e` 吃掉了，所以脚本按 `code=2` 匹配）表示「本机/账号已有在线会话」：
-   外网通就当成功，外网确实不通才去清旧会话
-4. 外网确实不通时才清旧会话：先调 `/cgi-bin/rad_user_dm`（设备下线），不行再 `action=logout`
+   外网通就当成功（网线拨号 PPPoE 在线时必然遇到，不用重复认证），外网确实不通才走下面两步
+4. 外网确实不通时：**先把本机链路接回来**（网线拨号重拨 → 连 Wi-Fi），还是被拒才清旧会话：
+   1. `GET /v1/srun_portal_online?user_name=账号&password=md5(密码)` —— 门户网页上
+      「在线设备管理」用的接口，能看到账号在所有 IP 上的会话（含每台设备的 OS 名）；
+      取不到就退回 `rad_user_info`（响应里的 `online_device_detail` 就是全部会话）
+   2. 逐个 IP 注销：先 `/cgi-bin/rad_user_dm`（设备下线，sign=sha1(时间+账号+IP+1+时间)），
+      不行再 `action=logout`（带上该 IP）；本机的旧会话先清，必要时连账号上其它设备一起清
 ```
 
 XXTEA 用的自定义 base64 字母表（与门户前端 `Portal.js` 一致）：
@@ -88,12 +93,20 @@ for attempt in 1..MAX_RETRY(20):
     提交 login()：成功则等 2 秒再验外网 → 通就退出
         若返回 err_code=2 / ip_already_online（本机或账号已有在线会话）：
             外网已通 → 直接按成功算（网线拨号 PPPoE 在线时必然遇到，不用重复认证）
-            外网确实不通 → 才 clear_stale_session() 清一次旧会话再重试
+            外网不通 → 先恢复本机链路（重拨 / 连 Wi-Fi，一次）—— 断网测试最常见的就是这种：
+                       Portal 哪都能到，可拨号已经掉线，光重试 Portal 认证永远登不上去
+            还是被拒 → clear_stale_sessions() 按「在线设备」列表注销旧会话，随即重登（不必等间隔）
         若返回「已在线」但外网仍不通：连续两次就停止折腾（避免探测被劫持时死循环）
-    检测到旧会话 → clear_stale_session() 踢掉一次再重试
     休眠 RETRY_INTERVAL(15 秒) 后重试
 全部失败 → 提示「检查账号密码 / 是否在校园网内」，退出(1)
 ```
+
+`clear_stale_sessions()` 清旧会话的顺序：
+
+1. 先清「看起来是本机」的会话：网卡 IP 对得上，或 OS 名 / 客户端名对得上（`_looks_like_ours()`）；
+2. 剩下的是账号上其它设备的会话，只有 `CLEAR_OTHER_DEVICES = True` 时才一起注销（默认 True，
+   日志里会写明动了哪些 IP）。因为 `err_code=2` 是**账号级**的：会话留在别的 IP 上时，
+   只清本机那一个 IP 根本没用 —— 这就是以前「断网后一直登不上、日志里反复 err_code=2」的老 bug。
 
 ### 3.4 界面（app.py）的任务模型
 
@@ -144,12 +157,20 @@ D:\Anaconda\python.exe E:\code\Auto-xdwlan\app.py
 ### 4.3 重新打包 exe（改完 app.py / autoconn.py 后）
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File E:\code\Auto-xdwlan\build_exe.ps1
+cd E:\code\Auto-xdwlan-main
+powershell -ExecutionPolicy Bypass -File .\build_exe.ps1 -Python D:\Anaconda\envs\paddle_env\python.exe
+Copy-Item .\dist\Auto-xdwlan.exe D:\Auto-xdwlan\ -Force      # 部署目录（exe 和 settings.json 都在这儿）
 ```
 
 输出 `dist\Auto-xdwlan.exe`。**打包前先退出正在运行的程序**（脚本会检测，占用时会提示"请先退出程序"）。
 打包会把 `dist\` 整个重建，但脚本会自动把 `dist\settings.json` 备份到临时目录、打完再还原，
 所以界面里填过的账号密码不会丢。
+
+本机打包环境（2026-09 实测）：`D:\Anaconda\python.exe` 里**没有** PyInstaller，
+能用的解释器是 `D:\Anaconda\envs\paddle_env\python.exe`（Python 3.9 + PyQt5 5.15.9 + PyInstaller 6.16，
+打出来 ~40.8 MB）；`envs\tracker`（Python 3.7，和 README 里写的 3.7 + PyQt5 5.9.2 最接近）没有 PyQt5，打不了。
+注意两条命令不能粘成一行，PowerShell 会把整串当成一个文件名（`-File "…ps1Copy-Item"` 就是这个问题），
+要么换行，要么用 `;` 分隔。
 
 ### 4.4 只用命令行（不启动界面）
 
@@ -178,6 +199,7 @@ D:\Anaconda\python.exe E:\code\Auto-xdwlan\autoconn.py --verbose    # 打印请�
 | `PPPOE_NAME` | `XidianPPPoE` | 自建拨号条目名（已有别的拨号连接会直接复用，如「宽带连接」） |
 | `PPPOE_USER` / `PPPOE_PASSWORD` | `''` | 留空 = 用上面的账号密码 |
 | `MAX_RETRY` / `RETRY_INTERVAL` | `20` / `15` | 重试次数 / 每次间隔秒数（界面版设为 18 / 10） |
+| `CLEAR_OTHER_DEVICES` | `True` | 断网后被 err_code=2 挡住时，是否连账号上其它在线设备一起注销；`False` = 只清本机的 |
 | `REQUEST_TIMEOUT` | `10` | 单次 HTTP 超时秒数（界面版设为 8） |
 | `LOG_FILE` | `None` | 默认不写日志文件；需要留档时自己赋一个路径 |
 
@@ -196,7 +218,8 @@ git push            # 开着 Clash 代理即可
 ## 五、注意事项
 
 * **依赖**：`requests`（命令行版）；界面版还需要 `PyQt5`（Anaconda 自带）；打包需要 `pyinstaller`。
-  当前打包环境：Python 3.7 + PyQt5 5.9.2 + PyInstaller 5.13.2。
+  当前打包环境：`D:\Anaconda\envs\paddle_env`（Python 3.9 + PyQt5 5.15.9 + PyInstaller 6.16），
+  见 4.3 —— 仓库最初是用 Python 3.7 + PyQt5 5.9.2 + PyInstaller 5.13.2 打的，那套环境本机已经没有。
 * **平时不写日志文件**：运行日志只在界面窗口里显示（内存中），退出即清空；
   只有出现「内部异常」时才会在程序同目录追加 `crash.log`（完整 traceback，超 256 KB 自动滚成 `crash.log.old`），
   排查完可以直接删。
@@ -218,8 +241,9 @@ git push            # 开着 Clash 代理即可
 * **远程仓库**：<https://github.com/Xiujinhub/Auto-xdwlan>（`settings.json` 已在 `.gitignore` 中，不会上传）。
 * **常见报错速查**：
   `E2620` = 账号在线设备数超限（去 `zfw.xidian.edu.cn` 踢设备）；
-  `login_error + err_code=2` = 本机/账号已有在线会话（走网线拨号时必然出现）：外网通就无需再认证，
-  外网确实不通才需要清旧会话（脚本会自动判断，不会再乱踢会话；也可 `--logout` 手动清）；
+  `login_error + err_code=2` = 本机/账号已有在线会话（走网线拨号时必然出现）：外网通就无需再认证；
+  外网确实不通时，脚本会先把本机链路接回来（重拨 / 连 Wi-Fi），还不行才按「在线设备」列表清旧会话
+  （`CLEAR_OTHER_DEVICES=True` 时连账号上其它设备一起注销，日志里会写明动了哪些 IP；也可 `--logout` 手动清）；
   拨号 `623` = 系统已有「所有用户」的拨号本（手动在“设置 → 网络和 Internet → 拨号”里建一条宽带连接，脚本之后会自动复用）。
 * 机器上若还跑着第三方校园网客户端（例如 `D:\xdwlan-login\xdwlan-login.exe`），两者不冲突、功能有重叠，
   同时开可能重复登录，但不会互相破坏。
