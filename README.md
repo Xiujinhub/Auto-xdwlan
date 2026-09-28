@@ -148,6 +148,8 @@ powershell -ExecutionPolicy Bypass -File E:\code\Auto-xdwlan\build_exe.ps1
 ```
 
 输出 `dist\Auto-xdwlan.exe`。**打包前先退出正在运行的程序**（脚本会检测，占用时会提示"请先退出程序"）。
+打包会把 `dist\` 整个重建，但脚本会自动把 `dist\settings.json` 备份到临时目录、打完再还原，
+所以界面里填过的账号密码不会丢。
 
 ### 4.4 只用命令行（不启动界面）
 

@@ -56,6 +56,16 @@ if ($running) {
     Write-Host "    请先退出程序（托盘图标右键 → 退出 Auto-xdwlan），然后重新运行本脚本。" -ForegroundColor Yellow
     exit 1
 }
+
+# 打包会重建整个 dist 目录，这里先把界面里填过的私有配置挪到临时目录，打完再放回去，
+# 免得每次重新打包都把 dist\settings.json（账号、密码、各选项）清掉。
+$settingsPath = Join-Path $here 'dist\settings.json'
+$settingsTemp = Join-Path $env:TEMP 'Auto-xdwlan-settings.backup.json'
+if (Test-Path $settingsPath) {
+    Move-Item -Force -Path $settingsPath -Destination $settingsTemp
+    Write-Host '    已备份 dist\settings.json（打包完成后会自动还原）' -ForegroundColor Yellow
+}
+
 foreach ($path in @('build', 'dist')) {
     $full = Join-Path $here $path
     if (-not (Test-Path $full)) { continue }
@@ -95,6 +105,11 @@ if ($LASTEXITCODE -ne 0) { throw '打包失败，请查看上面的错误信息'
 
 $exe = Join-Path $here ('dist\' + $Name + '.exe')
 if (-not (Test-Path $exe)) { throw "打包结束但没有找到 $exe" }
+
+if (Test-Path $settingsTemp) {
+    Move-Item -Force -Path $settingsTemp -Destination $settingsPath
+    Write-Host '    已还原 dist\settings.json（账号密码等配置没丢）' -ForegroundColor Yellow
+}
 
 $size = [Math]::Round((Get-Item $exe).Length / 1MB, 1)
 Write-Host ''
