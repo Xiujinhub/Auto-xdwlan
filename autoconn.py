@@ -1014,11 +1014,14 @@ def connect_wifi(ssid=None, wait=None, verbose=True):
         ok, message = _add_open_profile(ssid)
         if not ok:
             return False, '创建 %s 的无线配置文件失败（%s）' % (ssid, message)
+    elif not wifi_network_visible(ssid):
+        # 已经有配置文件时，别因为“这一次扫描没列出来”就放弃：
+        # netsh 的扫描结果是带缓存的，接口刚动过 / 刚断开时经常短暂为空，
+        # 但按配置连接本身是能成的（连不上会自然超时，不必事先拦着）。
+        debug('本次扫描没列出 %s，但系统里已有配置，直接尝试连接' % ssid)
 
-    if not wifi_network_visible(ssid):
-        return False, '当前扫描不到 %s，稍后重试' % ssid
-
-    _netsh(['wlan', 'connect', 'name=%s' % _quote(ssid), 'ssid=%s' % _quote(ssid)])
+    output = _netsh(['wlan', 'connect', 'name=%s' % _quote(ssid), 'ssid=%s' % _quote(ssid)])
+    debug('wlan connect 输出: %s' % output.strip()[:200])
 
     waited = 0
     while waited < wait:
@@ -1027,7 +1030,8 @@ def connect_wifi(ssid=None, wait=None, verbose=True):
         if wifi_current_ssid() == ssid:
             log('已连上 Wi-Fi %s（等待 %d 秒）' % (ssid, waited))
             return True, '已连接 %s' % ssid
-    return False, '连接 %s 超时（%d 秒）' % (ssid, wait)
+    return False, ('连接 %s 超时（%d 秒）：可能信号弱 / 不在覆盖范围 / 配置不对'
+                   '（加 --verbose 能看到 netsh 的原始输出）' % (ssid, wait))
 
 
 # ============================== 有线拨号（PPPoE） ==============================
@@ -1427,6 +1431,10 @@ def ensure_wifi(wait=None):
     """Portal 不可达时先确保无线连上校园网，再继续认证。"""
     global _WIFI_LAST_FAILURE
     if not WIFI_SSID or not WIFI_AUTO_CONNECT:
+        message = ('未配置 WIFI_SSID' if not WIFI_SSID else '界面里“允许连接 Wi-Fi”已关闭')
+        if message != _WIFI_LAST_FAILURE:      # 同样的话不重复刷
+            log('跳过连接 Wi-Fi：%s' % message)
+            _WIFI_LAST_FAILURE = message
         return False
     ok, message = connect_wifi(wait=wait, verbose=True)
     if ok:
@@ -1436,6 +1444,24 @@ def ensure_wifi(wait=None):
         log('Wi-Fi 连接未成功：%s' % message)
         _WIFI_LAST_FAILURE = message
     return False
+
+
+def use_wifi(attempt=1):
+    """改用无线：连上 WIFI_SSID、等网关就绪，再看能不能上网。返回是否已能上网。
+
+    和 recover_link() 里那一步的区别：这里不看 Portal 可不可达 —— 那是「网线这条试过
+    还是不通，直接换无线」用的（墙口坏掉 / 只给拨号不给直连时，能用的其实是 Wi-Fi）。
+    """
+    if not WIFI_SSID or not WIFI_AUTO_CONNECT:
+        ensure_wifi()       # 只为把「为什么没连 Wi-Fi」打进日志
+        return False
+    if not ensure_wifi(wait=WIFI_CONNECT_WAIT if attempt == 1 else 15):
+        return False
+    wait_for_network(max_wait=WIFI_CONNECT_WAIT)
+    connected, detail = check_internet()
+    if connected:
+        log('无线接入后已能上网（%s）' % detail)
+    return connected
 
 
 def ensure_pppoe(allow_redial=True):
@@ -1510,6 +1536,7 @@ def auto_connect():
 
     kicked = False
     link_recovered = False
+    wifi_tried = False
     already_online = 0
     pppoe_done = False
     for attempt in range(1, MAX_RETRY + 1):
@@ -1530,6 +1557,16 @@ def auto_connect():
                 return 0
         elif attempt == 1:
             wait_for_network()
+
+        # 网线这条（有网线、也有可用 IP）试过一轮还是上不去 → 换无线，别一直死磕网线：
+        # 不少墙口是坏的、或者只给拨号不给直连，这时真正能用的其实是 Wi-Fi。
+        # （没有网线 / 网线没拿到可用 IP 的情况，上面那一支已经会去连 Wi-Fi 了）
+        if not wifi_tried and attempt >= 2:
+            wifi_tried = True
+            if ethernet_link_up() and ethernet_has_ipv4():
+                log('网线这条试过还是上不去 → 改用 Wi-Fi（%s）' % WIFI_SSID)
+                if use_wifi(attempt):
+                    return 0
 
         ok, message = login()
         if ok:
