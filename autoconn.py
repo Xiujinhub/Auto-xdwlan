@@ -497,6 +497,13 @@ def login(ip=''):
     if error_code == 'ip_already_online_error' or \
             result.get('suc_msg') == 'ip_already_online_error':
         return True, '本机 IP 已经在线，无需重复登录'
+    if is_already_online_error(result):
+        # err_code=2 = 本机/账号上已有在线会话。只要外网确实通，就当「已在线」处理：
+        # 不需要重复认证，更不能去踢会话（踢了会把正在用的好连接弄断）。
+        connected, detail = check_internet()
+        if connected:
+            return True, '账号已在线（%s），无需重复认证' % detail
+        return False, '认证失败: %s' % _explain_error(result)
     return False, '认证失败: %s' % _explain_error(result)
 
 
@@ -515,12 +522,36 @@ def _explain_error(result):
     }
     if code in known:
         return '%s（%s）' % (known[code], message)
-    if 'err_code=2' in str(message):
-        return ('INFO Error，err_code=2：Portal 拒绝解析本次 info，'
-                '一般是因为该 IP / 账号当前已经在线的会话冲突，脚本会重试')
+    if _looks_like_err_code_2(message):
+        return ('INFO Error，err_code=2：本机/账号上已经有一个在线会话（走网线拨号 PPPoE 时，'
+                '拨号本身就是用同一套账号认证的，所以再走 Portal 必然被拒）；'
+                '外网通时无需重复认证，外网确实不通才需要清掉旧会话')
     if str(result.get('ecode')) == 'E2620':
         return '账号在线设备数已达上限(E2620)，请在自助服务里踢掉其它设备'
     return str(message)
+
+
+def _looks_like_err_code_2(message):
+    """判断错误信息是不是 srun 的 err_code=2。
+
+    注意：西电 Portal 会把中文逗号按 GBK 重新编码，返回的实际字符串是
+    `INFO Error锛宔rr_code=2`（"err_code" 的 e 被吃掉，变成 "锛宔rr_code"），
+    所以不能直接匹配 `'err_code=2'`，只匹配不受乱码影响的 `code=2` 部分。
+    """
+    return re.search(r'code\s*=\s*2\b', str(message)) is not None
+
+
+def is_already_online_error(result):
+    """Portal 返回的是不是「本机 / 账号已有在线会话」这类错误。
+
+    * `error == 'ip_already_online_error'`：该 IP 已经在线；
+    * `error_msg` 里带 `err_code=2`：srun 的会话冲突（网线拨号 PPPoE 在线时必然出现）。
+    """
+    code = str(result.get('error') or '')
+    message = str(result.get('error_msg') or result.get('suc_msg') or '')
+    if code == 'ip_already_online_error' or 'ip_already_online' in message:
+        return True
+    return _looks_like_err_code_2(message)
 
 
 def logout(ip=''):
@@ -1196,13 +1227,26 @@ def auto_connect():
         else:
             log('第 %d 次登录失败：%s' % (attempt, message))
 
-        # 账号/本机 IP 已有旧会话导致登录被拒时，先清理旧会话再重试
-        if not kicked and who_is_online(new_session()):
-            debug('检测到旧会话，先强制下线再重试')
-            kicked = True
-            ok, message = clear_stale_session()
-            log('清理旧会话：%s' % message)
-            time.sleep(3)
+        # 「已有在线会话」类失败要分两种情况处理：
+        #   * 外网已经通了（例如网线拨号 PPPoE 已经在线）→ 按成功处理，绝不踢会话；
+        #   * 外网确实不通 → 才算旧会话残留，清掉旧会话再重试。
+        conflict = any(key in message for key in
+                       ('code=2', '已在线', 'ip_already_online', '旧会话'))
+        if conflict:
+            connected, detail = check_internet()
+            if connected:
+                log('Portal 提示已有在线会话，但外网已恢复（%s），按成功处理' % detail)
+                return 0
+            if not kicked and who_is_online(new_session()):
+                debug('外网不通且存在旧会话，先强制下线再重试')
+                kicked = True
+                _, kick_message = clear_stale_session()
+                log('清理旧会话：%s' % kick_message)
+                time.sleep(3)
+                connected, detail = check_internet()
+                if connected:
+                    log('清理旧会话后已能上网（%s）' % detail)
+                    return 0
 
         if attempt < MAX_RETRY:
             time.sleep(RETRY_INTERVAL)

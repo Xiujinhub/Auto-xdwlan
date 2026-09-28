@@ -63,8 +63,11 @@ E:\code\Auto-xdwlan\
      password = '{MD5}' + HMAC-MD5(明文密码, token)
      info     = '{SRBX1}' + 自定义字母表base64( XXTEA(json用户信息, 密钥=token) )
      chksum   = SHA1(token+用户名+token+hmd5+token+ac_id+token+ip+token+200+token+1+token+info)
-3. 成功判定：error == 'ok' 或 res == 'ok'（'ip_already_online_error' 也算成功）
-4. err_code=2（本机 IP 上有状态异常的旧会话）→ 先调 /cgi-bin/rad_user_dm 踢掉旧会话再重试
+3. 成功判定：error == 'ok' 或 res == 'ok'（'ip_already_online_error' 也算成功）；
+   `err_code=2`（**原文是 `INFO Error锛宔rr_code=2`** —— 中文逗号被 Portal 按 GBK 重编码，
+   把 `err_code` 的 `e` 吃掉了，所以脚本按 `code=2` 匹配）表示「本机/账号已有在线会话」：
+   外网通就当成功，外网确实不通才去清旧会话
+4. 外网确实不通时才清旧会话：先调 `/cgi-bin/rad_user_dm`（设备下线），不行再 `action=logout`
 ```
 
 XXTEA 用的自定义 base64 字母表（与门户前端 `Portal.js` 一致）：
@@ -83,6 +86,9 @@ for attempt in 1..MAX_RETRY(20):
         先试一次网线拨号（PPPoE）→ 通了就退出
         还不可达 → 连 Wi-Fi(stu-xdwlan) + 等网关就绪（最多 30 秒）
     提交 login()：成功则等 2 秒再验外网 → 通就退出
+        若返回 err_code=2 / ip_already_online（本机或账号已有在线会话）：
+            外网已通 → 直接按成功算（网线拨号 PPPoE 在线时必然遇到，不用重复认证）
+            外网确实不通 → 才 clear_stale_session() 清一次旧会话再重试
         若返回「已在线」但外网仍不通：连续两次就停止折腾（避免探测被劫持时死循环）
     检测到旧会话 → clear_stale_session() 踢掉一次再重试
     休眠 RETRY_INTERVAL(15 秒) 后重试
@@ -210,7 +216,8 @@ git push            # 开着 Clash 代理即可
 * **远程仓库**：<https://github.com/Xiujinhub/Auto-xdwlan>（`settings.json` 已在 `.gitignore` 中，不会上传）。
 * **常见报错速查**：
   `E2620` = 账号在线设备数超限（去 `zfw.xidian.edu.cn` 踢设备）；
-  `login_error + err_code=2` = 本机 IP 有状态异常的旧会话（脚本会自动清理重试，也可 `--logout` 手动清）；
+  `login_error + err_code=2` = 本机/账号已有在线会话（走网线拨号时必然出现）：外网通就无需再认证，
+  外网确实不通才需要清旧会话（脚本会自动判断，不会再乱踢会话；也可 `--logout` 手动清）；
   拨号 `623` = 系统已有「所有用户」的拨号本（手动在“设置 → 网络和 Internet → 拨号”里建一条宽带连接，脚本之后会自动复用）。
 * 机器上若还跑着第三方校园网客户端（例如 `D:\xdwlan-login\xdwlan-login.exe`），两者不冲突、功能有重叠，
   同时开可能重复登录，但不会互相破坏。
