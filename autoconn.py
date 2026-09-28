@@ -35,6 +35,7 @@ import hmac
 import json
 import os
 import re
+import socket
 import subprocess
 import sys
 import tempfile
@@ -169,10 +170,24 @@ if not DOMAIN:
 # 判断"能上外网"用的探测地址：(url, 期望状态码)
 # generate_204 类接口正常情况下一定返回 204 且响应体为空；
 # 如果返回 200 且带内容，说明请求被 Portal 劫持（等于"没登录"）。
+#
+# 这里故意放了多个**互相独立**的地址（不同厂商、http / https 各一），只要有一个通就算联网：
+#   * 以前只有 miui + 百度两条，而百度的 http 探测早就废了（现在返回 302 跳到 https，
+#     脚本不跟跳转 → 永远算失败），等于全靠 miui 一条撑着；
+#     偏偏这条一抖（CDN、DNS、校园网拦一下）就被当成"断网"，接着去把好端端的拨号拆了重拨；
+#   * https 那条不会被校园网往响应里插东西，http 那条最快，两条都留着更保险。
 INTERNET_PROBES = (
     ('http://connect.rom.miui.com/generate_204', 204),
-    ('http://www.baidu.com/', 200),
+    ('https://connect.rom.miui.com/generate_204', 204),
+    ('https://connectivitycheck.platform.hicloud.com/generate_204', 204),
+    ('https://detectportal.firefox.com/success.txt', 200),
+    ('http://www.baidu.com/', 200),      # 会 302 跳到 https://www.baidu.com/，同站跳转算通
 )
+
+# 单个探测地址的最长等待秒数、以及一轮探测的总时间预算（秒）
+# 目的是：离线时别在探测上耗太久，同时保证至少能试到两三个地址。
+PROBE_TIMEOUT = 5
+PROBE_BUDGET = 12
 
 # 日志文件：默认不写文件（None）。日志只输出到控制台，界面版则显示在窗口的「运行日志」里。
 # 想留档时自己赋一个路径即可，例如：autoconn.LOG_FILE = r'D:\tmp\autoconn.log'
@@ -401,39 +416,134 @@ def who_is_online(session):
     return None
 
 
-def check_internet():
-    """探测是否真的能上外网：返回 (是否通, 说明)。
+def _short_host(url):
+    """把探测地址缩成 connect.rom.miui.com(http) 这种短标签，方便写一行日志。"""
+    host = re.sub(r'^[a-z]+://', '', str(url), flags=re.I).split('/', 1)[0]
+    scheme = 'https' if url.lower().startswith('https') else 'http'
+    return '%s(%s)' % (host, scheme)
 
-    注意：未登录时校园网会把请求劫持到 Portal 页面（HTTP 200 + 一个网页），
-    所以不能只看 200/204，还要看状态码是否与探测地址的约定一致、内容是不是 Portal 页。
-    """
-    for url, expect_status in INTERNET_PROBES:
-        try:
-            response = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT,
-                                    allow_redirects=False, proxies=NO_PROXY)
-        except requests.exceptions.RequestException as error:
-            debug('外网探测 %s 失败: %s' % (url, error))
-            continue
 
+def _same_site(url, location):
+    """跳转目标是不是同一个站点（http→https、带不带 www 都算同一个）。"""
+    def host(target):
+        target = re.sub(r'^[a-z]+://', '', str(target), flags=re.I)
+        target = target.split('/', 1)[0].split(':', 1)[0].strip().lower()
+        return target[4:] if target.startswith('www.') else target
+    target = host(location)
+    return bool(target) and host(url) == target
+
+
+def _probe_internet(url, expect_status, timeout):
+    """探测一个地址：返回 (是否算通, 简短说明)。"""
+    response = None
+    try:
+        response = requests.get(url, headers=HEADERS, timeout=timeout,
+                                allow_redirects=False, proxies=NO_PROXY, stream=True)
+        status = response.status_code
         location = response.headers.get('Location', '')
         if 'w.xidian.edu.cn' in location:
-            debug('外网探测 %s 被重定向到 Portal' % url)
-            continue
-        if response.status_code != expect_status:
-            debug('外网探测 %s 状态码 %s（期望 %s，可能被 Portal 劫持）'
-                  % (url, response.status_code, expect_status))
-            continue
-
-        body = response.content[:4096].lower().replace(b'\x00', b'')
+            return False, '被重定向到 Portal 页'
+        if 300 <= status < 400:
+            # 204 类探测出现跳转 = 被劫持；200 类探测跳到同站 https 只是站点自己升级
+            if expect_status == 204 or not _same_site(url, location):
+                return False, '跳转到 %s' % (location[:60] or '未知地址')
+            return True, '%s -> %s（跳转到 %s）' % (url, status, location[:60])
+        if status != expect_status:
+            return False, '状态码 %s（期望 %s）' % (status, expect_status)
+        # 只读一小块响应体，够判断有没有被塞 Portal 页就行（省流量也不拖时间）
+        chunk = b''
+        try:
+            for piece in response.iter_content(2048):
+                chunk = piece or b''
+                break
+        except Exception:
+            chunk = b''
+        body = chunk.lower().replace(b'\x00', b'')
         hijacked = b'srun' in body or b'xidian' in body
         if expect_status == 204:
             hijacked = hijacked or b'portal' in body or bool(body.strip(b'\r\n \t'))
         if hijacked:
-            debug('外网探测 %s 返回了 Portal 页面/响应体异常，说明还没真正联网' % url)
-            continue
-        return True, '%s -> %s' % (url, response.status_code)
+            return False, '响应体像 Portal 页面'
+        return True, '%s -> %s' % (url, status)
+    except requests.exceptions.RequestException as error:
+        return False, str(error)[:70]
+    finally:
+        if response is not None:
+            response.close()
 
-    return False, '外网不通'
+
+def check_internet():
+    """探测是否真的能上外网：返回 (是否通, 说明)。
+
+    注意：
+      * 未登录时校园网会把请求劫持到 Portal 页面（HTTP 200 + 一个网页），所以不能只看
+        200/204，还要看状态码是否与探测地址的约定一致、内容是不是 Portal 页；
+      * 探测地址有好几个（不同厂商、http/https 都有），只要有一个通就算联网 ——
+        单个地址抽风不能当成"断网"，否则会白白把正在用的拨号拆掉重拨；
+      * 一轮探测有时间预算（PROBE_BUDGET），离线时不至于卡很久。
+    """
+    global _LAST_PROBE_SUMMARY
+    deadline = time.time() + PROBE_BUDGET
+    reasons = []
+    for url, expect_status in INTERNET_PROBES:
+        timeout = max(2, min(PROBE_TIMEOUT, deadline - time.time()))
+        ok, reason = _probe_internet(url, expect_status, timeout)
+        if ok:
+            _LAST_PROBE_SUMMARY = None      # 恢复联网后，下次失败要重新报原因
+            return True, reason
+        debug('外网探测 %s 不通: %s' % (url, reason))
+        reasons.append('%s %s' % (_short_host(url), reason))
+        if time.time() >= deadline:
+            reasons.append('（到时间预算，后面几个不试了）')
+            break
+    summary = '；'.join(reasons)
+    if summary != _LAST_PROBE_SUMMARY:      # 同样的原因不重复刷屏
+        _LAST_PROBE_SUMMARY = summary
+        log('外网探测都没通过：%s' % summary)
+    return False, '外网不通（%d 个探测地址都没通，原因见运行日志）' % len(INTERNET_PROBES)
+
+
+# 门户域名上次解析到的 IP：用来做「不依赖 DNS」的校园网活性检查
+_PORTAL_LAST_IP = ''
+_LAST_PROBE_SUMMARY = None
+
+
+def _remember_portal_ip():
+    """记下门户域名解析到的 IP（判断链路活性时要用，见 campus_link_alive()）。"""
+    global _PORTAL_LAST_IP
+    try:
+        host = PORTAL.split('//', 1)[-1].split('/', 1)[0].split(':', 1)[0]
+        _PORTAL_LAST_IP = socket.gethostbyname(host)
+    except Exception as error:
+        debug('解析门户 IP 失败: %s' % error)
+
+
+def campus_link_alive(timeout=None):
+    """校园网那一段链路是不是还活着（不看外网、也不依赖 DNS）。
+
+    做法：直接按上次解析到的门户 IP 访问 https://<IP>/cgi-bin/get_challenge
+    （门户的 80 端口不通，443 可以；带 IP 访问时不能用证书校验）。
+
+    返回 True / False / None（None = 还不知道门户 IP，判断不了）。
+    用途：外网探测失败时，先看校园网这条路是不是真的断了 —— 如果门户按 IP 还能应答，
+    那就只是 DNS / 上游 / 代理的问题，不该把用户正在用的拨号拆了重拨。
+    """
+    if not _PORTAL_LAST_IP:
+        return None
+    url = 'https://%s/cgi-bin/get_challenge' % _PORTAL_LAST_IP
+    try:
+        response = requests.get(url, params={'username': USERNAME + DOMAIN, 'ip': '',
+                                             'callback': 'jQuery1',
+                                             '_': str(int(time.time()))},
+                                headers=HEADERS, proxies=NO_PROXY, verify=False,
+                                timeout=timeout or PROBE_TIMEOUT, stream=True)
+        try:
+            return response.status_code == 200
+        finally:
+            response.close()
+    except requests.exceptions.RequestException as error:
+        debug('按 IP 探测门户(%s)失败: %s' % (_PORTAL_LAST_IP, error))
+        return False
 
 
 def portal_reachable(timeout=None):
@@ -444,7 +554,10 @@ def portal_reachable(timeout=None):
                                         'callback': 'jQuery1', '_': str(int(time.time()))},
                                 headers=HEADERS, proxies=NO_PROXY,
                                 timeout=timeout or REQUEST_TIMEOUT)
-        return response.status_code == 200
+        if response.status_code == 200:
+            _remember_portal_ip()
+            return True
+        return False
     except requests.exceptions.RequestException as error:
         debug('Portal 不可达: %s' % error)
         return False
@@ -1325,13 +1438,20 @@ def ensure_wifi(wait=None):
     return False
 
 
-def ensure_pppoe():
-    """插着网线时用网线拨号（PPPoE）把网络接上。返回 (是否成功, 说明)。"""
+def ensure_pppoe(allow_redial=True):
+    """插着网线时用网线拨号（PPPoE）把网络接上。返回 (是否成功, 说明)。
+
+    allow_redial=False 时只会在"还没拨号"的情况下拨，绝不去动已经连着的拨号：
+    拆掉重拨会把用户正在用的连接断一下（IP 也变了，代理 / 网页上的连接全断），
+    只有确认链路上真出问题了才值得这么干。
+    """
     if not PPPOE_ENABLE or not PPPOE_NAME:
         return False, '未启用网线拨号'
 
     actives = active_dial_connections()
     if actives:
+        if not allow_redial:
+            return False, '已有拨号连接（%s），这次不动它' % '、'.join(actives)
         log('已有拨号连接（%s）但网络不通，重拨一次' % '、'.join(actives))
         pppoe_hangup()
         time.sleep(2)
@@ -1351,13 +1471,27 @@ def recover_link(attempt=1, dial=True):
     dial=False 时只做 Wi-Fi 那一步（拨号已经试过，不用重复拨）。
     """
     if dial and PPPOE_ENABLE:
-        ok, _ = ensure_pppoe()
+        # 已经有拨号连着的话，先确认「校园网这一段」是真断了再拆：
+        # 外网探测失败的原因很多（DNS 抽风、上游 CDN 不通、校园网往响应里插东西…），
+        # 按 IP 直连门户能应答就说明校园网这条路是活的 → 这次不重拨，等下一轮再说。
+        allow_redial = True
+        if active_dial_connections():
+            alive = campus_link_alive()
+            if alive:
+                allow_redial = False
+                log('外网探测不通，但校园网链路还活着（门户按 IP 能应答）→ 这次不重拨拨号，等下一轮')
+            elif alive is False:
+                log('校园网链路也探测不到（门户按 IP 没应答）→ 准备重拨拨号')
+        ok, _ = ensure_pppoe(allow_redial=allow_redial)
         if ok:
             time.sleep(3)
             connected, detail = check_internet()
             if connected:
                 log('网线拨号后已能上网（%s），无需 Portal 认证' % detail)
                 return True
+        elif not allow_redial:
+            # 拨号没动：至少把它当"这轮没恢复"，让调用方按正常节奏重试
+            return False
     if not portal_reachable(timeout=5):
         ensure_wifi(wait=WIFI_CONNECT_WAIT if attempt == 1 else 15)
         wait_for_network(max_wait=WIFI_CONNECT_WAIT)
@@ -1438,16 +1572,22 @@ def auto_connect():
                     return 0
             if not kicked:
                 kicked = True
-                cleared, kick_message = clear_stale_sessions()
-                log('清理旧会话：%s' % kick_message)
-                if cleared:
-                    # 会话刚清掉，不用再等 RETRY_INTERVAL，立刻重登一次
-                    time.sleep(3)
-                    connected, detail = check_internet()
-                    if connected:
-                        log('清理旧会话后已能上网（%s）' % detail)
-                        return 0
-                    continue
+                # 拨号还连着、而且校园网这一段是活的（门户按 IP 能应答）→ 说明问题不在
+                # 「会话残留」上：这时候去注销会话，会把正在用的拨号那条会话也踢下来，
+                # 白白把好连接弄断。那就什么都别动，等下一轮再试。
+                if active_dial_connections() and campus_link_alive() is True:
+                    log('拨号还在、校园网链路也活着 → 先不注销会话（免得把正在用的连接踢断），等下一轮再试')
+                else:
+                    cleared, kick_message = clear_stale_sessions()
+                    log('清理旧会话：%s' % kick_message)
+                    if cleared:
+                        # 会话刚清掉，不用再等 RETRY_INTERVAL，立刻重登一次
+                        time.sleep(3)
+                        connected, detail = check_internet()
+                        if connected:
+                            log('清理旧会话后已能上网（%s）' % detail)
+                            return 0
+                        continue
 
         if attempt < MAX_RETRY:
             time.sleep(RETRY_INTERVAL)

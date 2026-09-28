@@ -51,8 +51,24 @@ E:\code\Auto-xdwlan\
 3. **无线**：Portal 不可达 → `netsh wlan connect stu-xdwlan`（开放式网络，系统缺配置文件时自动生成）
    → 等网关就绪 → 走 Portal 认证。
 
-判断「能不能上网」的硬标准：探测 `http://connect.rom.miui.com/generate_204` 必须返回 **204**。
-未登录时校园网会把请求劫持到 Portal 页并返回 200，所以只看状态码不够，脚本还回退探测 `http://www.baidu.com/`。
+判断「能不能上网」的硬标准：轮流探测**多个互相独立的地址**（不同厂商、http/https 都有，
+见 `autoconn.py` 的 `INTERNET_PROBES`），任何一个通过就算联网：
+
+| 探测地址 | 期望 | 说明 |
+| --- | --- | --- |
+| `http://connect.rom.miui.com/generate_204` | 204 | 最快，优先试 |
+| `https://connect.rom.miui.com/generate_204` | 204 | https 不会被校园网往响应里插东西 |
+| `https://connectivitycheck.platform.hicloud.com/generate_204` | 204 | 华为 |
+| `https://detectportal.firefox.com/success.txt` | 200 | Mozilla |
+| `http://www.baidu.com/` | 200 | 它会 302 跳到 https，**同站跳转算通** |
+
+未登录时校园网会把请求劫持到 Portal 页（还会往 HTTP 响应里插提示），所以光看状态码不够：
+204 类要求响应体为空、200 类要求响应体里没有 `srun` / `xidian`。
+一轮探测有 12 秒总预算（`PROBE_BUDGET`，单条最多 5 秒），离线时不会卡很久。
+
+> 以前这里只有 miui + 百度两条，而百度的 http 探测早就废了（现在返回 302 跳到 https，
+> 脚本不跟跳转 → 永远失败），等于全靠 miui 一条撑着；那条一抖就被判成「断网」，
+> 接着把用户正在用的拨号拆掉重拨 —— 这正是「连着代理时网络老是断一下」的来源，v2.3 修掉。
 
 ### 3.2 Portal（srun）认证算法
 
@@ -95,7 +111,11 @@ for attempt in 1..MAX_RETRY(20):
             外网已通 → 直接按成功算（网线拨号 PPPoE 在线时必然遇到，不用重复认证）
             外网不通 → 先恢复本机链路（重拨 / 连 Wi-Fi，一次）—— 断网测试最常见的就是这种：
                        Portal 哪都能到，可拨号已经掉线，光重试 Portal 认证永远登不上去
+                       但**拨号还连着时先别急着拆**：按 IP 直连门户（不依赖 DNS）看看校园网这一段
+                       还活着吗 —— 活着说明只是外网/DNS/CDN 抽风，这次不重拨、也不注销会话；
+                       探测不到才算链路真出问题，才允许拆掉重拨
             还是被拒 → clear_stale_sessions() 按「在线设备」列表注销旧会话，随即重登（不必等间隔）
+                       （拨号在 + 校园网链路活着 时同样跳过：此刻注销会把正在用的拨号会话踢断）
         若返回「已在线」但外网仍不通：连续两次就停止折腾（避免探测被劫持时死循环）
     休眠 RETRY_INTERVAL(15 秒) 后重试
 全部失败 → 提示「检查账号密码 / 是否在校园网内」，退出(1)
@@ -107,6 +127,11 @@ for attempt in 1..MAX_RETRY(20):
 2. 剩下的是账号上其它设备的会话，只有 `CLEAR_OTHER_DEVICES = True` 时才一起注销（默认 True，
    日志里会写明动了哪些 IP）。因为 `err_code=2` 是**账号级**的：会话留在别的 IP 上时，
    只清本机那一个 IP 根本没用 —— 这就是以前「断网后一直登不上、日志里反复 err_code=2」的老 bug。
+
+再补一句 `campus_link_alive()`（v2.3 新增）：外网探测失败时，先按**上次解析到的门户 IP** 直连
+`https://<IP>/cgi-bin/get_challenge`（门户 80 端口不通、443 可以，所以只能 https + 不校验证书）。
+它不看外网、也不依赖 DNS，专门回答「校园网这一段还活着吗」——活着就别拆拨号、别注销会话，
+只安静重试；只有它也探测不到，才认为链路真出问题了。
 
 ### 3.4 界面（app.py）的任务模型
 
@@ -200,6 +225,7 @@ D:\Anaconda\python.exe E:\code\Auto-xdwlan\autoconn.py --verbose    # 打印请�
 | `PPPOE_USER` / `PPPOE_PASSWORD` | `''` | 留空 = 用上面的账号密码 |
 | `MAX_RETRY` / `RETRY_INTERVAL` | `20` / `15` | 重试次数 / 每次间隔秒数（界面版设为 18 / 10） |
 | `CLEAR_OTHER_DEVICES` | `True` | 断网后被 err_code=2 挡住时，是否连账号上其它在线设备一起注销；`False` = 只清本机的 |
+| `PROBE_TIMEOUT` / `PROBE_BUDGET` | `5` / `12` | 单个探测地址的超时 / 一轮探测的总预算（秒） |
 | `REQUEST_TIMEOUT` | `10` | 单次 HTTP 超时秒数（界面版设为 8） |
 | `LOG_FILE` | `None` | 默认不写日志文件；需要留档时自己赋一个路径 |
 
@@ -223,6 +249,11 @@ git push            # 开着 Clash 代理即可
 * **平时不写日志文件**：运行日志只在界面窗口里显示（内存中），退出即清空；
   只有出现「内部异常」时才会在程序同目录追加 `crash.log`（完整 traceback，超 256 KB 自动滚成 `crash.log.old`），
   排查完可以直接删。
+* **别把正在用的连接拆了**（v2.3）：外网探测失败 ≠ 链路坏了。探测地址现在有 5 个（互相独立，
+  http/https 都有，其中百度的 http 探测以前一直是废的、等于全靠 miui 一条），
+  而且拨号还连着时会先 `campus_link_alive()` 按 IP 直连门户确认「校园网这段还活着吗」：
+  活着就只安静重试，不重拨拨号、也不注销会话。**断线自动重连的间隔别设太短**
+  （界面里的「分钟」，之前设成 2 分钟会让这类抽风反复触发，建议 5 ~ 10 分钟）。
 * **断网后能自己连上了**（v2.2）：以前拔网线 / 掉线后，账号在 NAS 上残留的会话会让 Portal 一直回
   `err_code=2`，而脚本既不重拨拨号、又因为只看「本机当前 IP」而不去清会话，于是无限重试也上不去。
   现在：先恢复本机链路（重拨 / 连 Wi-Fi）→ 还是被拒就把「在线设备」列表里的旧会话注销掉再重登（见 3.2 / 3.3）。
