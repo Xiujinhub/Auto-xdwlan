@@ -253,8 +253,33 @@ D:\Anaconda\python.exe E:\code\Auto-xdwlan\autoconn.py --verbose    # 打印请�
 cd E:\code\Auto-xdwlan
 git add -A
 git commit -m "说明这次改了什么"
-git push            # 开着 Clash 代理即可
+git push            # 开着 Watt Toolkit / Clash 即可
+git tag v2.5        # 发版时打个轻量 tag（历史 tag 都是轻量的）
+git push origin v2.5
 ```
+
+本机在这台电脑上推送要先关掉证书**吊销检查**（github 流量被 Watt Toolkit 的本地证书拦截，
+schannel 拿不到 CRL 会直接失败）。`E:\code\Auto-xdwlan` 这个仓库已经配好了：
+
+```powershell
+git config --local http.sslBackend schannel        # 用 Windows 证书库（已信任 Watt Toolkit 的 CA）
+git config --local http.schannelCheckRevoke false  # 不查吊销
+```
+
+报 `SSL certificate problem: unable to get local issuer certificate` 就是上面这两项没配
+（Git 自带的 OpenSSL 根证书列表里没有 Watt Toolkit 的 CA）。要是这台机器上还没有 `.git`
+（例如从 GitHub 下的 zip），重建成本地仓库：
+
+```powershell
+git init -b main
+git remote add origin https://github.com/Xiujinhub/Auto-xdwlan.git
+git config --local http.sslBackend schannel; git config --local http.schannelCheckRevoke false
+git fetch origin; git reset origin/main      # 用远端 HEAD 对齐历史，工作区文件保持不动
+```
+
+发布带 exe 的 Release：exe 不进仓库（`dist/` 已 gitignore，且仓库文件 >50 MB 会告警），
+走 Release 附件上传（API：`POST /repos/:owner/:repo/releases` 再
+`POST https://uploads.github.com/repos/:owner/:repo/releases/:id/assets?name=Auto-xdwlan.exe`）。
 
 ## 五、注意事项
 
