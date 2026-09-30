@@ -131,13 +131,20 @@ MAX_RETRY = 20
 RETRY_INTERVAL = 15
 
 # ---------- 断开后重连时「清旧会话」的力度 ----------
-# 断网（拔网线 / 掉线 / 主动断开）后，账号在 NAS 上残留的在线会话会让 Portal 直接
-# 返回 err_code=2「已有在线会话」，本机就再也登不上去。脚本会先查账号的在线设备列表
-# （Portal 的「在线设备管理」接口），把挡路的会话注销掉：
-#   True  = 先清本机自己的旧会话；外网仍不通，就把账号上其它在线设备也一起注销
-#           （等效于在 zfw.xidian.edu.cn 里逐个踢设备），保证本机这次能登上去
-#   False = 只清「看起来是本机」的会话（本机网卡 IP 对得上，或 OS / 客户端名对得上）
-CLEAR_OTHER_DEVICES = True
+# 2026-09-30 实测（西电，本机同时插着网线 + 连着 stu-xdwlan）：
+#   * 同一个账号同一时刻只允许一条在线会话 —— 有线直连 / 网线拨号 / 无线共用同一套账号，
+#     本机有线那条在线时，从无线发起的认证必然被拒，返回 err_code=2；
+#   * 用设备下线接口（rad_user_dm）把会话踢掉后，Portal 的「在线设备」列表立刻变空，
+#     但 NAS 上的计费会话还要几分钟才释放，这期间**所有**登录都回 err_code=2；
+#   * 所以「先清会话再重登」经常不是救命，而是把本来能用的一条链路弄断好几分钟，
+#     还会把账号上别人的设备（手机等）一起踢下线。
+# 因此默认不再自动清会话：
+#   CLEAR_SESSIONS = False → 只把冲突原因写进日志、按间隔重试，等 NAS 自己放行（推荐）
+#   CLEAR_SESSIONS = True  → 保留旧行为：被 err_code=2 挡住时主动注销挡路的会话
+#       CLEAR_OTHER_DEVICES = True  连账号上其它在线设备一起清（等效于在门户里踢设备）
+#       CLEAR_OTHER_DEVICES = False 只清「看起来是本机」的会话（网卡 IP / OS 名对得上）
+CLEAR_SESSIONS = False
+CLEAR_OTHER_DEVICES = False
 
 # ---------- 无线网络（Wi-Fi）自动连接 ----------
 # 脚本发现"Portal 不可达"时会自动去找并连接这个 SSID，然后继续认证
@@ -154,6 +161,11 @@ PPPOE_NAME = 'XidianPPPoE'   # 拨号连接名（会出现在 Windows“拨号�
 PPPOE_USER = ''              # 留空 = 用上面的 USERNAME；运营商线路可写 '学号@dx' 等
 PPPOE_PASSWORD = ''          # 留空 = 用上面的 PASSWORD
 PPPOE_DIAL_TIMEOUT = 100     # 单次拨号最长等待秒数
+# Portal 一直登不上（例如账号已有在线会话、err_code=2）时，是否再试一次网线拨号。
+# 说明：西电的拨号（PPPoE）和 Portal 认证共用同一套账号，所以账号被占用时拨号同样可能被拒；
+# 但实测这个墙口确实能拨号（rasdial 成功过），所以留一次尝试机会，
+# 失败原因（619 / 628 / 691 等）会原样打进日志，方便判断是「墙口不支持」还是「账号被占用」。
+PPPOE_FALLBACK = True
 
 # 单次 HTTP 请求超时（秒）
 REQUEST_TIMEOUT = 10
@@ -537,6 +549,38 @@ def _remember_portal_ip():
         debug('解析门户 IP 失败: %s' % error)
 
 
+def portal_host():
+    """Portal 域名（不含协议 / 端口），解析它的 IP 用来判断「流量实际走哪条网卡」。"""
+    return PORTAL.split('//', 1)[-1].split('/', 1)[0].split(':', 1)[0]
+
+
+def campus_source_ip():
+    """本机发往 Portal 的流量实际会用哪个 IPv4 出去（判断不了返回 ''）。
+
+    用途：本机同时插着网线、又连着无线时，Windows 只会挑一条（默认有线优先，因为它的
+    网卡跃点更小），Portal 也只认那一条 —— 日志里把出口 IP 写清楚，就不会再出现
+    「日志写着无线=stu-xdwlan，其实流量全走网线」这种误判。
+    """
+    host = _PORTAL_LAST_IP
+    if not host:
+        try:
+            host = socket.gethostbyname(portal_host())
+        except Exception as error:
+            debug('解析门户 IP 失败: %s' % error)
+            return ''
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(3)
+        try:
+            sock.connect((host, 443))
+            return sock.getsockname()[0]
+        finally:
+            sock.close()
+    except Exception as error:
+        debug('判断出口 IP 失败: %s' % error)
+        return ''
+
+
 def campus_link_alive(timeout=None):
     """校园网那一段链路是不是还活着（不看外网、也不依赖 DNS）。
 
@@ -669,9 +713,11 @@ def _explain_error(result):
     if code in known:
         return '%s（%s）' % (known[code], message)
     if _looks_like_err_code_2(message):
-        return ('INFO Error，err_code=2：本机/账号上已经有一个在线会话（走网线拨号 PPPoE 时，'
-                '拨号本身就是用同一套账号认证的，所以再走 Portal 必然被拒）；'
-                '外网通时无需重复认证，外网确实不通才需要清掉旧会话')
+        return ('INFO Error，err_code=2：账号 %s 已经有一条在线会话 —— 西电同一账号同一时刻'
+                '只允许一条（有线直连 / 网线拨号 / 无线共用同一套账号）。是本机的就先把那条'
+                '链路停掉（拔网线 / 断开拨号 / 关无线），是别的设备的就到那台设备上退出校园网'
+                '（或去 zfw.xidian.edu.cn 踢掉）；刚踢过会话的话，NAS 要几分钟才释放，'
+                '这期间登录都会是这个错' % (USERNAME + DOMAIN))
     if str(result.get('ecode')) == 'E2620':
         return '账号在线设备数已达上限(E2620)，请在自助服务里踢掉其它设备'
     return str(message)
@@ -906,6 +952,38 @@ def clear_stale_sessions():
     return cleared, '；'.join(results)
 
 
+# 上一次「账号被谁占着」的日志内容：内容没变就不重复刷屏
+_LAST_CONFLICT_REPORT = None
+
+
+def _report_session_conflict():
+    """err_code=2 时把「账号被谁占着」写清楚，并给出下一步该怎么办。
+
+    背景（实测）：西电同一账号同一时刻只允许一条在线会话，有线直连 / 网线拨号 / 无线
+    三者共用同一套账号。别的设备（或本机另一条链路）占着账号时，本机的登录会被拒；
+    而刚被踢掉的会话在 NAS 上还要几分钟才真正释放，这期间登录一样会被拒。
+    """
+    global _LAST_CONFLICT_REPORT
+    entries = []
+    try:
+        for item in online_sessions():
+            ours = item['ip'] in set(local_ipv4_addresses())
+            entries.append('%s%s%s' % (item['ip'],
+                                       '（本机）' if ours else '（其它设备）',
+                                       '·%s' % item['os_name'] if item.get('os_name') else ''))
+    except Exception as error:
+        debug('查询在线设备失败: %s' % error)
+    report = '、'.join(entries) or '在线设备列表为空（NAS 还没释放刚被踢掉的会话）'
+    if report == _LAST_CONFLICT_REPORT:
+        return
+    _LAST_CONFLICT_REPORT = report
+    log('账号 %s 上当前还有在线会话：%s' % (USERNAME + DOMAIN, report))
+    if not CLEAR_SESSIONS:
+        log('按默认配置不动这些会话（CLEAR_SESSIONS=False）：是本机的就先停掉那条链路'
+            '（拔网线 / 断开拨号 / 关无线），是别的设备的就到那台设备上退出校园网'
+            '（或去 zfw.xidian.edu.cn 踢掉）；NAS 释放旧会话一般要几分钟，等一会儿会自动恢复')
+
+
 # ============================== 无线网络（Wi-Fi） ==============================
 # 说明：netsh 的中文输出可能按 UTF-8 或 GBK 编码，而且界面文字是本地化的，
 # 所以这里只解析 ASCII 关键字（SSID / name=...），不解析任何中文提示，避免编码坑。
@@ -914,6 +992,9 @@ _NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0x08000000)
 
 # 记录上一次 Wi-Fi 失败原因，避免每轮重试都往日志里刷同样的话
 _WIFI_LAST_FAILURE = None
+
+# 上一次 `netsh wlan connect` 的原始输出：失败时用来分辨「无线被系统关掉」这类原因
+_LAST_WIFI_CONNECT_OUTPUT = ''
 
 
 def _netsh(args, timeout=None):
@@ -1049,7 +1130,9 @@ def _add_open_profile(ssid):
 
 def _wifi_connect_once(ssid, wait, label=''):
     """执行一次 wlan connect 并等到关联成功。返回实际等待秒数；超时返回 None。"""
+    global _LAST_WIFI_CONNECT_OUTPUT
     output = _netsh(['wlan', 'connect', 'name=%s' % _quote(ssid), 'ssid=%s' % _quote(ssid)])
+    _LAST_WIFI_CONNECT_OUTPUT = output
     debug('wlan connect 输出: %s' % output.strip()[:200])
     waited = 0
     while waited < wait:
@@ -1059,6 +1142,28 @@ def _wifi_connect_once(ssid, wait, label=''):
             log('%s已连上 Wi-Fi %s（等待 %d 秒）' % (label, ssid, waited))
             return waited
     return None
+
+
+def wifi_radio_hint():
+    """无线连不上时，判断是不是「无线开关被关了」这类原因；不是就返回 ''。
+
+    实测（2026-09-30 本机）：Windows 的 Wi-Fi 开关（或笔记本无线快捷键）把无线**软件**关掉后，
+    `netsh wlan show interfaces` 会显示「无线电状态：硬件 开 / 软件 关」，
+    `netsh wlan connect` 直接报错 **0x80342002**（连接请求失败），扫描结果也变成空；
+    这时候不管怎么重连都连不上，必须在系统里把 Wi-Fi 开关打开。
+    netsh 的错误码是 ASCII，可以放心匹配，不受中英文界面影响。
+    """
+    if '0x80342002' in (_LAST_WIFI_CONNECT_OUTPUT or ''):
+        return ('无线网卡被系统关掉了（netsh 报 0x80342002 = 无线软件开关关着）：'
+                '请在 Windows 的「网络」里打开 Wi-Fi 开关（笔记本可按一下无线快捷键，'
+                '也顺便看一眼飞行模式），或者在「网络连接」里把无线网卡禁用再启用一次')
+    try:
+        if wifi_interface_present() and not wifi_scan_ssids():
+            return ('当前扫不到任何无线网络：无线开关可能没打开（或网卡被禁用、驱动异常），'
+                    '请先确认 Wi-Fi 开关 / 飞行模式')
+    except Exception as error:
+        debug('判断无线开关状态失败: %s' % error)
+    return ''
 
 
 def connect_wifi(ssid=None, wait=None, verbose=True, retry=True):
@@ -1116,6 +1221,9 @@ def connect_wifi(ssid=None, wait=None, verbose=True, retry=True):
         if _wifi_connect_once(ssid, max(10, wait // 2), label='重连后') is not None:
             return True, '已连接 %s（断开重连后）' % ssid
 
+    hint = wifi_radio_hint()
+    if hint:
+        return False, '连接 %s 失败：%s' % (ssid, hint)
     return False, ('连接 %s 超时（%d 秒）：可能信号弱 / 不在覆盖范围 / 配置不对；'
                    '当前无线：%s（加 --verbose 能看到 netsh 的原始输出）'
                    % (ssid, wait, wifi_current_ssid() or '未连接'))
@@ -1233,14 +1341,17 @@ def _powershell_json(script):
         return None
 
 
-def wired_adapters():
-    """列出物理有线网卡：[{name, link, ip}, ...]。"""
-    script = ("Get-NetAdapter -Physical | Where-Object {$_.MediaType -eq '802.3'} | "
+def _physical_adapters(media_type):
+    """列出某种介质类型的物理网卡：[{name, link, ip}, ...]；查不到返回 []。
+
+    media_type：'802.3' = 有线，'Native 802.11' = 无线（Get-NetAdapter 的写法）。
+    """
+    script = ("Get-NetAdapter -Physical | Where-Object {$_.MediaType -eq '%s'} | "
               "ForEach-Object { "
               "$ip = (Get-NetIPAddress -InterfaceAlias $_.Name -AddressFamily IPv4 "
               "-ErrorAction SilentlyContinue | Select-Object -First 1).IPAddress; "
               "[pscustomobject]@{ Name=$_.Name; Status=$_.Status; IP=$ip } } | "
-              "ConvertTo-Json -Compress")
+              "ConvertTo-Json -Compress" % media_type)
     data = _powershell_json(script)
     if not data:
         return []
@@ -1258,18 +1369,47 @@ def wired_adapters():
     return result
 
 
+def wired_adapters():
+    """列出物理有线网卡：[{name, link, ip}, ...]。"""
+    return _physical_adapters('802.3')
+
+
+def wireless_adapters():
+    """列出物理无线网卡：[{name, link, ip}, ...]。"""
+    return _physical_adapters('Native 802.11')
+
+
+def wifi_adapter_ipv4():
+    """无线网卡当前的 IPv4（没连上 / 没有无线网卡返回 ''）。"""
+    for item in wireless_adapters():
+        if item['link'] and item['ip']:
+            return item['ip']
+    return ''
+
+
+def wired_state():
+    """一次查全有线网卡状态：(是否插着网线, 是否有可用 IPv4, 说明文字)。
+
+    日志和界面都要这两项，而每次查询都要起一次 PowerShell（比较慢），
+    所以合并成一个函数，避免同一轮里重复查询。
+    """
+    items = wired_adapters()
+    link = any(item['link'] for item in items)
+    has_ip = any(item['link'] and item['ip'] and not item['ip'].startswith('169.254.')
+                 for item in items)
+    described = '、'.join('%s%s' % (item['name'], '(%s)' % item['ip'] if item['ip'] else '')
+                          for item in items if item['link'] or item['ip'])
+    return link, has_ip, described
+
+
 def ethernet_link_up():
     """是否插着网线（物理有线网卡链路 Up）。"""
-    return any(item['link'] for item in wired_adapters())
+    return wired_state()[0]
 
 
 def ethernet_has_ipv4():
     """有线网卡是否拿到了可用 IP（排除 169.254.x.x 这种自动私有地址）。"""
-    for item in wired_adapters():
-        ip = item['ip']
-        if item['link'] and ip and not ip.startswith('169.254.'):
-            return True
-    return False
+    return wired_state()[1]
 
 
 def local_ipv4_addresses():
@@ -1542,6 +1682,14 @@ def use_wifi(attempt=1):
     if not WIFI_SSID or not WIFI_AUTO_CONNECT:
         ensure_wifi()       # 只为把「为什么没连 Wi-Fi」打进日志
         return False
+    # 有线这条在用的时候别去白折腾无线（2026-09-30 实测）：
+    #   1) 账号同一时刻只允许一条在线会话 → 有线在线时，无线的认证必然被 Portal 拒（err_code=2）；
+    #   2) Windows 默认把流量走有线（网卡跃点更小）→ 就算无线认证上了，流量也还是走有线。
+    # 所以这里只把原因写清楚，让用户自己决定（拔网线 / 禁用有线网卡）。
+    if wired_link_is_egress() and campus_link_alive() is True:
+        log('网线这条在用（出口 IP 走有线），而账号只允许一条在线会话 → 不去连无线；'
+            '要让无线真正生效，请拔掉网线，或在「网络连接」里禁用有线网卡')
+        return False
     if not ensure_wifi(wait=WIFI_CONNECT_WAIT if attempt == 1 else 15):
         return False
     wait_for_network(max_wait=WIFI_CONNECT_WAIT)
@@ -1599,6 +1747,35 @@ def link_looks_usable():
         return False
 
 
+def wired_link_is_egress():
+    """系统当前是不是把发往校园网的流量交给有线网卡（= 有线优先，无线只是挂着）。
+
+    依据：本机到 Portal 的出口 IP 是不是有线网卡的 IP（Windows 按网卡跃点选路，
+    有线的跃点通常更小，所以同时插网线 + 连无线时走的都是有线）。
+    """
+    egress = campus_source_ip()
+    if not egress:
+        return False
+    return any(item['link'] and item['ip'] == egress for item in wired_adapters())
+
+
+def link_report():
+    """一行说明「本机现在到底走哪条链路」，用于运行日志与 --check。"""
+    link, has_ip, described = wired_state()
+    ssid = wifi_current_ssid()
+    wifi_ip = wifi_adapter_ipv4()
+    if ssid:
+        wifi_text = ssid + ('(%s)' % wifi_ip if wifi_ip else '')
+    else:
+        wifi_text = wifi_ip or '未连接'
+    return ('有线=%s（%s）；无线=%s；拨号=%s；出口IP=%s'
+            % (described if link else '未插网线',
+               '有可用IP' if has_ip else '无可用IP',
+               wifi_text,
+               '、'.join(active_dial_connections()) or '无',
+               campus_source_ip() or '未知'))
+
+
 def recover_link(attempt=1, dial=True):
     """断网后重新建立链路：先网线拨号（PPPoE），还不行再连 Wi-Fi。返回是否已能上网。
 
@@ -1637,15 +1814,22 @@ def recover_link(attempt=1, dial=True):
 
 def auto_connect():
     """核心逻辑：能上外网就退出；否则登录，失败就按间隔重试。"""
+    # 账号形状检查：西电学号是 11 位数字（'@dx' 这类运营商后缀不算）。填错一位会一直认证失败，
+    # 而且 Portal 往往只回一个含糊的 err_code=2，所以先把这句提醒打出来。
+    if USERNAME and not re.fullmatch(r'\d{11}', USERNAME):
+        log('提醒：账号「%s」看起来不是 11 位学号，先确认没填错（少一位 / 多一位都会一直认证失败）'
+            % (USERNAME + DOMAIN))
     session = new_session()
     online_user = who_is_online(session)
     if online_user:
         log('Portal 记录显示 %s 已在线' % online_user)
     # 先把本机当前走的是哪条链路写进日志：以后排查「自动连不上」时，一眼就能看出是
-    # 「无线没连上」还是「连上了但认证被拒」，不用再靠猜（这次的问题就出在这里）。
-    log('本机当前链路：无线=%s，拨号=%s'
-        % (wifi_current_ssid() or '未连接',
-           '、'.join(active_dial_connections()) or '无'))
+    # 「无线没连上」「连上了但认证被拒」还是「流量其实走的是网线」，不用再靠猜。
+    log('本机当前链路：%s' % link_report())
+    if WIFI_SSID and wifi_current_ssid() == WIFI_SSID and ethernet_link_up():
+        log('注意：本机同时插着网线、又连着 %s。Windows 默认把流量走有线（网卡跃点比无线小），'
+            'Portal 也只认有线那条 —— 日志里的「无线=%s」并不代表无线在上网；'
+            '要让无线真正生效，请拔掉网线，或在「网络连接」里禁用有线网卡' % (WIFI_SSID, WIFI_SSID))
 
     kicked = False
     link_recovered = False
@@ -1734,7 +1918,7 @@ def auto_connect():
                 pppoe_done = pppoe_done or dial
                 if recover_link(attempt, dial=dial):
                     return 0
-            if not kicked:
+            if CLEAR_SESSIONS and not kicked:
                 kicked = True
                 # 拨号还连着、而且校园网这一段是活的（门户按 IP 能应答）→ 说明问题不在
                 # 「会话残留」上：这时候去注销会话，会把正在用的拨号那条会话也踢下来，
@@ -1742,7 +1926,7 @@ def auto_connect():
                 if active_dial_connections() and campus_link_alive() is True:
                     log('拨号还在、校园网链路也活着 → 先不注销会话（免得把正在用的连接踢断），等下一轮再试')
                 else:
-                    log('登录被拒（账号上已有在线会话），开始注销挡路的旧会话…')
+                    log('登录被拒（账号上已有在线会话），按配置开始注销挡路的旧会话…')
                     cleared, kick_message = clear_stale_sessions()
                     log('清理旧会话：%s' % kick_message)
                     if cleared:
@@ -1753,6 +1937,24 @@ def auto_connect():
                             log('清理旧会话后已能上网（%s）' % detail)
                             return 0
                         continue
+            elif not CLEAR_SESSIONS:
+                # 默认不动这些会话（见文件开头 CLEAR_SESSIONS 的说明）：先把「账号被谁占着」
+                # 写清楚，再按间隔等 NAS 自己释放。
+                _report_session_conflict()
+                # 有线在手的话，顺手试一次网线拨号：拨号与 Portal 共用同一套账号，
+                # 但换个认证通道，说不定能通（实测这个墙口能拨号）。只试一次，
+                # 失败就把 rasdial 的错误码原样报出来。
+                if PPPOE_ENABLE and PPPOE_FALLBACK and not pppoe_done and ethernet_link_up():
+                    pppoe_done = True
+                    log('Portal 一直被拒（账号已有在线会话）→ 试一次网线拨号（PPPoE，同一套账号）…')
+                    dial_ok, dial_message = pppoe_dial()
+                    log('网线拨号：%s' % dial_message)
+                    if dial_ok:
+                        time.sleep(3)
+                        connected, detail = check_internet()
+                        if connected:
+                            log('拨号后已能上网（%s），无需 Portal 认证' % detail)
+                            return 0
 
         if attempt < MAX_RETRY:
             time.sleep(RETRY_INTERVAL)
@@ -1801,6 +2003,7 @@ def main(argv=None):
         log('系统里的拨号条目: %s'
             % ('、'.join('%s(端口%s)' % (n, p or '默认') for n, p in entries)
                if entries else '无'))
+        log('链路详情: %s' % link_report())
         connected, detail = check_internet()
         log('外网连通: %s（%s）' % (connected, detail))
         online_user = who_is_online(new_session())

@@ -32,7 +32,7 @@ import autoconn
 
 APP_NAME = 'Auto-xdwlan'
 APP_TITLE = '西电校园网自动连接'
-APP_VERSION = '2.5'
+APP_VERSION = '2.6'
 SETTINGS_FILE = 'settings.json'
 LOCAL_SERVER = 'Auto-xdwlan-gui'
 
@@ -169,6 +169,8 @@ SETTINGS_DEFAULTS = {
     'wifi_ssid': autoconn.WIFI_SSID,
     'wifi_enable': True,
     'pppoe_enable': True,
+    'pppoe_fallback': True,
+    'clear_sessions': False,
     'pppoe_name': autoconn.PPPOE_NAME,
     'autostart': False,
     'background': True,
@@ -241,6 +243,9 @@ def apply_settings(data):
     autoconn.WIFI_SSID = (data.get('wifi_ssid') or '').strip()
     autoconn.WIFI_AUTO_CONNECT = bool(data.get('wifi_enable'))
     autoconn.PPPOE_ENABLE = bool(data.get('pppoe_enable'))
+    autoconn.PPPOE_FALLBACK = bool(data.get('pppoe_fallback', True))
+    autoconn.CLEAR_SESSIONS = bool(data.get('clear_sessions', False))
+    autoconn.CLEAR_OTHER_DEVICES = False      # 只清「看起来是本机」的会话，不动别人的设备
     autoconn.PPPOE_NAME = (data.get('pppoe_name') or '').strip() or 'XidianPPoE'
     autoconn.PPPOE_USER = ''
     autoconn.PPPOE_PASSWORD = ''
@@ -315,13 +320,16 @@ def job_check():
         info['dial'] = []
     info['link'] = False
     info['ip'] = False
-    # 只有既没拨号也没无线时才去查有线网卡（这一步要起 PowerShell，比较慢）
-    if not info['dial'] and not info['wifi']:
-        try:
-            info['link'] = autoconn.ethernet_link_up()
-            info['ip'] = autoconn.ethernet_has_ipv4()
-        except Exception:
-            pass
+    # 网线和无线可能同时在用（Windows 只会走其中一条），所以两个状态都要显示。
+    # wired_state() 一次查完有线网卡，只起一次 PowerShell（比较慢的那一步）。
+    try:
+        info['link'], info['ip'], _ = autoconn.wired_state()
+    except Exception:
+        pass
+    try:
+        info['egress'] = autoconn.campus_source_ip()
+    except Exception:
+        info['egress'] = ''
     info['target'] = autoconn.WIFI_SSID
 
     connected, detail = autoconn.check_internet()
@@ -885,6 +893,21 @@ class MainWindow(QtWidgets.QMainWindow):
         advanced.addWidget(self.pppoe_check)
         advanced.addStretch(1)
         card.body.addLayout(advanced)
+
+        advanced2 = QtWidgets.QHBoxLayout()
+        advanced2.setSpacing(14)
+        self.fallback_check = QtWidgets.QCheckBox('Portal 被拒时试一次网线拨号')
+        self.fallback_check.setChecked(bool(self.settings.get('pppoe_fallback', True)))
+        self.fallback_check.setToolTip('账号被占用导致 Portal 认证一直失败（err_code=2）时，'
+                                       '再用同一个账号试一次 PPPoE 拨号')
+        advanced2.addWidget(self.fallback_check)
+        self.clear_check = QtWidgets.QCheckBox('会话冲突时清掉旧会话（会踢掉在用的链路）')
+        self.clear_check.setChecked(bool(self.settings.get('clear_sessions', False)))
+        self.clear_check.setToolTip('默认不勾：账号同一时刻只允许一条在线会话，踢掉之后 NAS 要等几分钟\n'
+                                    '才释放，这期间连本机也会登不上。只有确认是「僵尸会话」才勾选。')
+        advanced2.addWidget(self.clear_check)
+        advanced2.addStretch(1)
+        card.body.addLayout(advanced2)
         return card
 
     def _build_log_card(self):
@@ -1009,16 +1032,21 @@ class MainWindow(QtWidgets.QMainWindow):
             self.status_text.setText('未接入网络')
             self.status_sub.setText('未检测到网线与 Wi-Fi，请检查连接')
 
+        # 网线和无线可能同时在（Windows 只会走其中一条），所以两条都列出来，
+        # 并标出「出口 IP」—— 免得看到「无线 · stu-xdwlan」就以为流量走的无线。
+        parts = []
         if dials:
-            route = '网线拨号 · ' + '、'.join(dials)
-        elif wifi:
-            route = '无线 · ' + wifi
-        elif info.get('ip'):
-            route = '有线直连'
+            parts.append('网线拨号 · ' + '、'.join(dials))
+        if info.get('ip'):
+            parts.append('有线直连')
         elif info.get('link'):
-            route = '网线已插入（未取得 IP）'
-        else:
-            route = '无可用链路'
+            parts.append('网线已插入（未取得 IP）')
+        if wifi:
+            parts.append('无线 ' + wifi)
+        route = '；'.join(parts) or '无可用链路'
+        egress = info.get('egress') or ''
+        if egress:
+            route += '（出口 %s）' % egress
         self.value_route.setText(route)
 
         wifi_text = wifi or '未连接'
@@ -1172,6 +1200,8 @@ class MainWindow(QtWidgets.QMainWindow):
         data['reconnect_minutes'] = int(self.interval_spin.value())
         data['wifi_enable'] = self.wifi_check.isChecked()
         data['pppoe_enable'] = self.pppoe_check.isChecked()
+        data['pppoe_fallback'] = self.fallback_check.isChecked()
+        data['clear_sessions'] = self.clear_check.isChecked()
         return data
 
     def save_and_apply(self):
