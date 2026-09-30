@@ -32,7 +32,7 @@ import autoconn
 
 APP_NAME = 'Auto-xdwlan'
 APP_TITLE = '西电校园网自动连接'
-APP_VERSION = '2.8'
+APP_VERSION = '2.9'
 SETTINGS_FILE = 'settings.json'
 LOCAL_SERVER = 'Auto-xdwlan-gui'
 
@@ -509,6 +509,11 @@ QPushButton#Tiny {
     border-radius: 7px; padding: 3px 9px; font-size: 11.5px;
 }
 QPushButton#Tiny:hover { border-color: #38A9FF; color: #D7EBFF; }
+QToolButton#Link {
+    color: #62C6FF; background: transparent; border: none;
+    font-size: 12px; padding: 2px 6px;
+}
+QToolButton#Link:hover { color: #9ADBFF; }
 QCheckBox { color: #BFDCF3; font-size: 12.5px; spacing: 9px; }
 QCheckBox::indicator {
     width: 15px; height: 15px; border-radius: 5px;
@@ -556,15 +561,15 @@ class Card(QtWidgets.QFrame):
         super(Card, self).__init__(parent)
         self.setObjectName('Card')
         outer = QtWidgets.QVBoxLayout(self)
-        outer.setContentsMargins(14, 11, 14, 13)
-        outer.setSpacing(9)
+        outer.setContentsMargins(13, 10, 13, 11)
+        outer.setSpacing(7)
         if title:
             label = QtWidgets.QLabel(title)
             label.setObjectName('CardTitle')
             outer.addWidget(label)
         self.body = QtWidgets.QVBoxLayout()
         self.body.setContentsMargins(0, 0, 0, 0)
-        self.body.setSpacing(9)
+        self.body.setSpacing(7)
         outer.addLayout(self.body)
 
 
@@ -629,10 +634,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setWindowTitle('%s · %s' % (APP_NAME, APP_TITLE))
         self.setWindowFlags(QtCore.Qt.FramelessWindowHint | QtCore.Qt.Window)
         self.setAttribute(QtCore.Qt.WA_TranslucentBackground)
-        self.setMinimumSize(400, 520)
+        self.setMinimumSize(420, 500)
         available = QtWidgets.QApplication.primaryScreen().availableGeometry()
-        height = min(770, max(520, available.height() - 40))
-        width = min(470, max(400, available.width() - 60))
+        height = min(690, max(500, available.height() - 60))
+        width = min(470, max(420, available.width() - 60))
         self.resize(width, height)
         self.move(available.center() - self.rect().center())
         if os.path.exists(ICON_PATH):
@@ -694,11 +699,14 @@ class MainWindow(QtWidgets.QMainWindow):
 
         inner = QtWidgets.QVBoxLayout(content)
         inner.setContentsMargins(2, 0, 2, 0)
-        inner.setSpacing(10)
+        inner.setSpacing(8)
         inner.addWidget(self._build_status_card())
         inner.addWidget(self._build_account_card())
         inner.addWidget(self._build_settings_card())
-        inner.addWidget(self._build_log_card(), 1)
+        self.inner_layout = inner
+        self.log_card = self._build_log_card()
+        self.log_card_index = inner.count()
+        inner.addWidget(self.log_card, 1)
         box.addWidget(self._build_footer())
 
     def _build_header(self):
@@ -741,53 +749,68 @@ class MainWindow(QtWidgets.QMainWindow):
         return header
 
     def _build_status_card(self):
-        card = Card('连接状态')
+        card = Card('')          # 大状态就是标题，不再单独占一行
         self.status_card = card
 
         top = QtWidgets.QHBoxLayout()
-        top.setSpacing(12)
+        top.setSpacing(10)
         self.dot = QtWidgets.QLabel()
-        self.dot.setFixedSize(18, 18)
+        self.dot.setFixedSize(16, 16)
         self._paint_dot(C_IDLE)
         top.addWidget(self.dot)
 
         text_box = QtWidgets.QVBoxLayout()
-        text_box.setSpacing(2)
+        text_box.setSpacing(1)
         self.status_text = field_label('检测中…', 'StatusText')
         self.status_sub = field_label('正在获取当前网络状态', 'StatusSub')
+        # 允许被压缩 + 自动换行，否则长文案（出口 IP 等）会把右侧按钮挤出窗口
+        self.status_sub.setWordWrap(True)
+        self.status_sub.setSizePolicy(QtWidgets.QSizePolicy.Ignored,
+                                      QtWidgets.QSizePolicy.Preferred)
         text_box.addWidget(self.status_text)
         text_box.addWidget(self.status_sub)
         top.addLayout(text_box, 1)
-        card.body.addLayout(top)
 
-        grid = QtWidgets.QGridLayout()
-        grid.setHorizontalSpacing(10)
-        grid.setVerticalSpacing(6)
-        grid.setColumnMinimumWidth(0, 62)
-        rows = (('上网方式', 'route'), ('无线网络', 'wifi'),
-                ('在线账号', 'user'), ('外网连通', 'net'))
-        for index, (key, attr) in enumerate(rows):
-            grid.addWidget(field_label(key, 'FieldKey'), index, 0)
-            value = field_label('—')
-            value.setWordWrap(True)
-            setattr(self, 'value_' + attr, value)
-            grid.addWidget(value, index, 1)
-        grid.setColumnStretch(1, 1)
-        card.body.addLayout(grid)
-
-        buttons = QtWidgets.QHBoxLayout()
-        buttons.setSpacing(8)
+        # 主操作放右上角：最常用的「立即连接」一眼就能点到
         self.connect_btn = QtWidgets.QPushButton('立即连接')
         self.connect_btn.setObjectName('Primary')
         self.connect_btn.setCursor(QtCore.Qt.PointingHandCursor)
+        self.connect_btn.setFixedWidth(84)
         self.connect_btn.clicked.connect(lambda: self.start_job('connect'))
-        buttons.addWidget(self.connect_btn, 1)
+        top.addWidget(self.connect_btn)
 
         self.refresh_btn = QtWidgets.QPushButton('刷新')
         self.refresh_btn.setObjectName('Ghost')
         self.refresh_btn.setCursor(QtCore.Qt.PointingHandCursor)
+        self.refresh_btn.setFixedWidth(48)
         self.refresh_btn.clicked.connect(lambda: self.start_job('check'))
-        buttons.addWidget(self.refresh_btn)
+        top.addWidget(self.refresh_btn)
+        card.body.addLayout(top)
+
+        # 四项详情压成 2×2，省掉一半高度（完整信息放 tooltip，鼠标停上去就能看）
+        grid = QtWidgets.QGridLayout()
+        grid.setHorizontalSpacing(10)
+        grid.setVerticalSpacing(5)
+        rows = (('上网方式', 'route', '在线账号', 'user'),
+                ('无线网络', 'wifi', '外网连通', 'net'))
+        for index, (left_key, left_attr, right_key, right_attr) in enumerate(rows):
+            grid.addWidget(field_label(left_key, 'FieldKey'), index, 0)
+            left = field_label('—')
+            setattr(self, 'value_' + left_attr, left)
+            grid.addWidget(left, index, 1)
+            grid.addWidget(field_label(right_key, 'FieldKey'), index, 2)
+            right = field_label('—')
+            setattr(self, 'value_' + right_attr, right)
+            grid.addWidget(right, index, 3)
+        grid.setColumnMinimumWidth(0, 54)
+        grid.setColumnMinimumWidth(2, 54)
+        grid.setColumnStretch(1, 3)
+        grid.setColumnStretch(3, 2)
+        card.body.addLayout(grid)
+
+        buttons = QtWidgets.QHBoxLayout()
+        buttons.setSpacing(8)
+        buttons.addStretch(1)
 
         self.disconnect_btn = QtWidgets.QPushButton('断开')
         self.disconnect_btn.setObjectName('Ghost')
@@ -807,32 +830,32 @@ class MainWindow(QtWidgets.QMainWindow):
         return card
 
     def _build_account_card(self):
-        card = Card('账号信息')
+        card = Card('账号')
         grid = QtWidgets.QGridLayout()
-        grid.setHorizontalSpacing(10)
+        grid.setHorizontalSpacing(8)
         grid.setVerticalSpacing(8)
-        grid.setColumnMinimumWidth(0, 62)
-        grid.setColumnStretch(1, 1)
 
         grid.addWidget(field_label('账号', 'FieldKey'), 0, 0)
         self.username_edit = QtWidgets.QLineEdit(self.settings.get('username', ''))
-        self.username_edit.setPlaceholderText('统一身份认证账号（学号）')
-        grid.addWidget(self.username_edit, 0, 1, 1, 2)
+        self.username_edit.setPlaceholderText('学号（统一身份认证账号）')
+        self.username_edit.setMinimumWidth(64)
+        grid.addWidget(self.username_edit, 0, 1)
 
-        grid.addWidget(field_label('密码', 'FieldKey'), 1, 0)
+        grid.addWidget(field_label('密码', 'FieldKey'), 0, 2)
         self.password_edit = QtWidgets.QLineEdit(self.settings.get('password', ''))
         self.password_edit.setEchoMode(QtWidgets.QLineEdit.Password)
         self.password_edit.setPlaceholderText('校园网密码')
-        grid.addWidget(self.password_edit, 1, 1)
+        self.password_edit.setMinimumWidth(64)
+        grid.addWidget(self.password_edit, 0, 3)
         self.show_password_btn = QtWidgets.QPushButton('显示')
         self.show_password_btn.setObjectName('Tiny')
         self.show_password_btn.setCheckable(True)
         self.show_password_btn.setCursor(QtCore.Qt.PointingHandCursor)
-        self.show_password_btn.setFixedWidth(46)
+        self.show_password_btn.setFixedWidth(38)
         self.show_password_btn.toggled.connect(self._toggle_password)
-        grid.addWidget(self.show_password_btn, 1, 2)
+        grid.addWidget(self.show_password_btn, 0, 4)
 
-        grid.addWidget(field_label('运营商', 'FieldKey'), 2, 0)
+        grid.addWidget(field_label('运营商', 'FieldKey'), 1, 0)
         self.domain_combo = QtWidgets.QComboBox()
         for text, value in DOMAIN_CHOICES:
             self.domain_combo.addItem(text, value)
@@ -841,11 +864,18 @@ class MainWindow(QtWidgets.QMainWindow):
             if value == current:
                 self.domain_combo.setCurrentIndex(index)
                 break
-        grid.addWidget(self.domain_combo, 2, 1, 1, 2)
+        grid.addWidget(self.domain_combo, 1, 1)
 
-        self.remember_check = QtWidgets.QCheckBox('记住密码（保存在本机 settings.json）')
+        self.remember_check = QtWidgets.QCheckBox('记住密码')
         self.remember_check.setChecked(bool(self.settings.get('remember_password', True)))
-        grid.addWidget(self.remember_check, 3, 1, 1, 2)
+        self.remember_check.setToolTip('密码以「异或 + base64」混淆后存在本机 settings.json'
+                                       '（只是不成明文，不是加密，别外发这个文件）')
+        grid.addWidget(self.remember_check, 1, 3, 1, 2)
+
+        grid.setColumnMinimumWidth(0, 42)
+        grid.setColumnMinimumWidth(2, 42)
+        grid.setColumnStretch(1, 1)
+        grid.setColumnStretch(3, 1)
         card.body.addLayout(grid)
         return card
 
@@ -854,83 +884,128 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QLineEdit.Normal if shown else QtWidgets.QLineEdit.Password)
         self.show_password_btn.setText('隐藏' if shown else '显示')
 
+    def _toggle_advanced(self, shown):
+        """展开 / 收起「高级」里的两个危险开关。"""
+        self.advanced_box.setVisible(shown)
+        self.advanced_btn.setText('▾ 高级' if shown else '▸ 高级')
+
+    def _toggle_log(self, shown):
+        """展开 / 收起运行日志（收起后窗口更紧凑，也不再占着剩余空间）。"""
+        self.log_view.setVisible(shown)
+        self.log_toggle.setText('收起' if shown else '展开')
+        try:
+            # 收起时让日志卡回到「只有标题行」的高度，别留一大片空白
+            self.inner_layout.setStretch(self.log_card_index, 1 if shown else 0)
+        except Exception:
+            pass
+
     def _build_settings_card(self):
         card = Card('设置')
 
-        self.autostart_check = QtWidgets.QCheckBox('开机自启动（登录 Windows 后自动在后台运行）')
+        # 三行短标签 + tooltip 说明（原来一行一个勾选项、标签很长，界面被撑得很高）
+        row1 = QtWidgets.QHBoxLayout()
+        row1.setSpacing(12)
+        self.autostart_check = QtWidgets.QCheckBox('开机自启动')
+        self.autostart_check.setToolTip('登录 Windows 后自动在后台运行（写当前用户注册表，不需要管理员）')
         self.autostart_check.setChecked(bool(self.settings.get('autostart')))
         self.autostart_check.toggled.connect(self._on_autostart_toggled)
-        card.body.addWidget(self.autostart_check)
-
-        self.background_check = QtWidgets.QCheckBox('后台运行（关闭窗口时最小化到托盘，不断网）')
+        row1.addWidget(self.autostart_check)
+        self.background_check = QtWidgets.QCheckBox('后台运行')
+        self.background_check.setToolTip('关闭窗口时最小化到托盘，不断网')
         self.background_check.setChecked(bool(self.settings.get('background', True)))
-        card.body.addWidget(self.background_check)
-
+        row1.addWidget(self.background_check)
         self.autoconnect_check = QtWidgets.QCheckBox('启动后自动连接')
         self.autoconnect_check.setChecked(bool(self.settings.get('connect_on_start', True)))
-        card.body.addWidget(self.autoconnect_check)
+        row1.addWidget(self.autoconnect_check)
+        row1.addStretch(1)
+        card.body.addLayout(row1)
 
-        reconnect_row = QtWidgets.QHBoxLayout()
-        reconnect_row.setSpacing(8)
+        row2 = QtWidgets.QHBoxLayout()
+        row2.setSpacing(12)
+        self.wifi_check = QtWidgets.QCheckBox('允许连接 Wi-Fi')
+        self.wifi_check.setToolTip('允许自动连接 / 切换校园网无线（默认 stu-xdwlan）')
+        self.wifi_check.setChecked(bool(self.settings.get('wifi_enable', True)))
+        row2.addWidget(self.wifi_check)
+        self.pppoe_check = QtWidgets.QCheckBox('允许网线拨号')
+        self.pppoe_check.setToolTip('允许用网线做 PPPoE 拨号（自动复用系统里已有的「宽带连接」）')
+        self.pppoe_check.setChecked(bool(self.settings.get('pppoe_enable', True)))
+        row2.addWidget(self.pppoe_check)
+        row2.addStretch(1)
+        card.body.addLayout(row2)
+
+        row3 = QtWidgets.QHBoxLayout()
+        row3.setSpacing(8)
         self.reconnect_check = QtWidgets.QCheckBox('断线自动重连')
         self.reconnect_check.setChecked(bool(self.settings.get('auto_reconnect', True)))
-        reconnect_row.addWidget(self.reconnect_check)
-        reconnect_row.addStretch(1)
-        reconnect_row.addWidget(field_label('每', 'FieldKey'))
+        row3.addWidget(self.reconnect_check)
+        row3.addWidget(field_label('每', 'FieldKey'))
         self.interval_spin = QtWidgets.QSpinBox()
         self.interval_spin.setRange(1, 240)
         self.interval_spin.setSuffix(' 分钟')
         self.interval_spin.setValue(int(self.settings.get('reconnect_minutes', 10) or 10))
-        self.interval_spin.setFixedWidth(88)
-        reconnect_row.addWidget(self.interval_spin)
-        card.body.addLayout(reconnect_row)
+        self.interval_spin.setFixedWidth(84)
+        row3.addWidget(self.interval_spin)
+        row3.addStretch(1)
 
-        advanced = QtWidgets.QHBoxLayout()
-        advanced.setSpacing(14)
-        self.wifi_check = QtWidgets.QCheckBox('允许连接 Wi-Fi')
-        self.wifi_check.setChecked(bool(self.settings.get('wifi_enable', True)))
-        advanced.addWidget(self.wifi_check)
-        self.pppoe_check = QtWidgets.QCheckBox('允许网线拨号')
-        self.pppoe_check.setChecked(bool(self.settings.get('pppoe_enable', True)))
-        advanced.addWidget(self.pppoe_check)
-        advanced.addStretch(1)
-        card.body.addLayout(advanced)
+        self.advanced_btn = QtWidgets.QToolButton()
+        self.advanced_btn.setObjectName('Link')
+        self.advanced_btn.setCheckable(True)
+        self.advanced_btn.setText('▸ 高级')
+        self.advanced_btn.setCursor(QtCore.Qt.PointingHandCursor)
+        self.advanced_btn.setToolTip('平时用不到的两个开关（都带风险，默认不动）')
+        self.advanced_btn.toggled.connect(self._toggle_advanced)
+        row3.addWidget(self.advanced_btn)
+        card.body.addLayout(row3)
 
-        advanced2 = QtWidgets.QHBoxLayout()
-        advanced2.setSpacing(14)
-        self.fallback_check = QtWidgets.QCheckBox('Portal 被拒时试一次网线拨号')
+        # 高级选项：默认收起，点「▸ 高级」才展开（主界面保持干净）
+        self.advanced_box = QtWidgets.QWidget()
+        adv = QtWidgets.QVBoxLayout(self.advanced_box)
+        adv.setContentsMargins(0, 2, 0, 0)
+        adv.setSpacing(7)
+        self.fallback_check = QtWidgets.QCheckBox('Portal 被拒时，试一次网线拨号')
+        self.fallback_check.setToolTip('账号被占用（err_code=2）导致 Portal 认证一直失败时，'
+                                       '再用同一个账号试一次 PPPoE 拨号，失败原因会写进日志')
         self.fallback_check.setChecked(bool(self.settings.get('pppoe_fallback', True)))
-        self.fallback_check.setToolTip('账号被占用导致 Portal 认证一直失败（err_code=2）时，'
-                                       '再用同一个账号试一次 PPPoE 拨号')
-        advanced2.addWidget(self.fallback_check)
-        self.clear_check = QtWidgets.QCheckBox('会话冲突时清掉旧会话（会踢掉在用的链路）')
+        adv.addWidget(self.fallback_check)
+        self.clear_check = QtWidgets.QCheckBox('会话冲突时清掉旧会话（会把自己也踢下线几分钟）')
+        self.clear_check.setToolTip('默认不勾：账号同一时刻只允许一条在线会话，踢掉后 NAS 要几分钟才释放，'
+                                    '这期间连本机也登不上。只有确认是「僵尸会话」才勾选。')
         self.clear_check.setChecked(bool(self.settings.get('clear_sessions', False)))
-        self.clear_check.setToolTip('默认不勾：账号同一时刻只允许一条在线会话，踢掉之后 NAS 要等几分钟\n'
-                                    '才释放，这期间连本机也会登不上。只有确认是「僵尸会话」才勾选。')
-        advanced2.addWidget(self.clear_check)
-        advanced2.addStretch(1)
-        card.body.addLayout(advanced2)
+        adv.addWidget(self.clear_check)
+        self.advanced_box.setVisible(False)
+        card.body.addWidget(self.advanced_box)
         return card
 
     def _build_log_card(self):
-        card = Card('运行日志')
+        card = Card('')
         self.log_card = card
+
         head = QtWidgets.QHBoxLayout()
-        note = field_label('只显示在窗口里，不写日志文件', 'Hint')
-        head.addWidget(note)
+        head.setSpacing(8)
+        head.addWidget(field_label('运行日志', 'CardTitle'))
+        head.addWidget(field_label('仅界面显示，不写文件', 'Hint'))
         head.addStretch(1)
-        clear = QtWidgets.QPushButton('清空')
-        clear.setObjectName('Tiny')
-        clear.setCursor(QtCore.Qt.PointingHandCursor)
-        clear.clicked.connect(lambda: self.log_view.clear())
-        head.addWidget(clear)
+        self.clear_log_btn = QtWidgets.QPushButton('清空')
+        self.clear_log_btn.setObjectName('Tiny')
+        self.clear_log_btn.setCursor(QtCore.Qt.PointingHandCursor)
+        self.clear_log_btn.clicked.connect(lambda: self.log_view.clear())
+        head.addWidget(self.clear_log_btn)
+        self.log_toggle = QtWidgets.QPushButton('收起')
+        self.log_toggle.setObjectName('Tiny')
+        self.log_toggle.setCheckable(True)
+        self.log_toggle.setChecked(True)
+        self.log_toggle.setCursor(QtCore.Qt.PointingHandCursor)
+        self.log_toggle.setToolTip('收起 / 展开运行日志')
+        self.log_toggle.toggled.connect(self._toggle_log)
+        head.addWidget(self.log_toggle)
         card.body.addLayout(head)
 
         self.log_view = QtWidgets.QPlainTextEdit()
         self.log_view.setObjectName('Log')
         self.log_view.setReadOnly(True)
         self.log_view.setMaximumBlockCount(600)
-        self.log_view.setMinimumHeight(96)
+        self.log_view.setMinimumHeight(92)
+        self.log_view.setMaximumHeight(150)
         self.log_view.setPlaceholderText('这里会显示连接过程与结果…')
         card.body.addWidget(self.log_view)
         return card
@@ -1008,7 +1083,7 @@ class MainWindow(QtWidgets.QMainWindow):
             pass
 
     def _paint_dot(self, color):
-        self.dot.setStyleSheet('background-color: %s; border-radius: 9px;' % color)
+        self.dot.setStyleSheet('background-color: %s; border-radius: 8px;' % color)
 
     def update_status(self, info):
         if not info:
@@ -1021,10 +1096,12 @@ class MainWindow(QtWidgets.QMainWindow):
         user = info.get('user') or ''
         detail = info.get('detail') or ''
 
+        # 上网方式用最短的说法，细节（拨号连接名 / 出口 IP）放 tooltip
+        egress = info.get('egress') or ''
         if connected:
             self._paint_dot(C_OK)
             self.status_text.setText('已连接')
-            self.status_sub.setText('当前可以正常访问外网')
+            self.status_sub.setText('外网通畅' + (' · 出口 %s' % egress if egress else ''))
         elif dials or wifi or info.get('ip') or info.get('link'):
             self._paint_dot(C_ERR)
             self.status_text.setText('未连接')
@@ -1032,33 +1109,34 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             self._paint_dot(C_WARN)
             self.status_text.setText('未接入网络')
-            self.status_sub.setText('未检测到网线与 Wi-Fi，请检查连接')
+            self.status_sub.setText('没检测到可用链路，请检查网线 / Wi-Fi')
+        self.status_sub.setToolTip(detail or '')
 
-        # 网线和无线可能同时在（Windows 只会走其中一条），所以两条都列出来，
-        # 并标出「出口 IP」—— 免得看到「无线 · stu-xdwlan」就以为流量走的无线。
-        parts = []
         if dials:
-            parts.append('网线拨号 · ' + '、'.join(dials))
-        if info.get('ip'):
-            parts.append('有线直连')
+            route = '网线拨号'
+        elif info.get('ip'):
+            route = '有线直连'
         elif info.get('link'):
-            parts.append('网线已插入（未取得 IP）')
-        if wifi:
-            parts.append('无线 ' + wifi)
-        route = '；'.join(parts) or '无可用链路'
-        egress = info.get('egress') or ''
-        if egress:
-            route += '（出口 %s）' % egress
+            route = '网线已插入'
+        elif wifi:
+            route = '无线'
+        else:
+            route = '无可用链路'
         self.value_route.setText(route)
+        self.value_route.setToolTip('出口 IP（流量实际走的那条链路）：%s%s'
+                                    % (egress or '未知',
+                                       ('\n拨号连接：' + '、'.join(dials)) if dials else ''))
 
-        wifi_text = wifi or '未连接'
-        if target and wifi != target:
-            wifi_text += '（目标 %s）' % target
-        self.value_wifi.setText(wifi_text)
+        self.value_wifi.setText(wifi or '未连接')
+        self.value_wifi.setToolTip('目标无线：%s' % (target or '未配置'))
 
-        self.value_user.setText(user + ' 已在线' if user else '未查询到（未登录）')
-        self.value_net.setText(('通畅 · ' if connected else '不通 · ') + (detail or '—'))
-        self.tray.setToolTip('%s · %s\n%s' % (APP_NAME, self.status_text.text(), route))
+        self.value_user.setText(user or '未登录')
+        self.value_user.setToolTip('Portal 记录的在线账号')
+
+        self.value_net.setText('通畅' if connected else '不通')
+        self.value_net.setToolTip(detail or '—')
+        self.tray.setToolTip('%s · %s\n%s%s' % (APP_NAME, self.status_text.text(), route,
+                                               ('（出口 %s）' % egress) if egress else ''))
 
     def set_busy(self, busy, job_name=''):
         self.busy = busy
