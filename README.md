@@ -253,6 +253,7 @@ D:\Anaconda\python.exe E:\code\Auto-xdwlan\autoconn.py --verbose    # 打印请�
 | `PPPOE_USER` / `PPPOE_PASSWORD` | `''` | 留空 = 用上面的账号密码 |
 | `MAX_RETRY` / `RETRY_INTERVAL` | `20` / `15` | 重试次数 / 每次间隔秒数（界面版设为 18 / 10） |
 | `PPPOE_FALLBACK` | `True` | Portal 被拒（err_code=2）时，是否再用同一个账号试一次网线拨号 |
+| `CONFLICT_WAIT` | `300` | 被「已有在线会话」挡住时，等 NAS 释放旧会话的等待窗口（秒）；期间每 `RETRY_INTERVAL` 秒重试一次，**不注销任何会话**，点「停止」可随时中止 |
 | `CLEAR_SESSIONS` | `False` | 被 err_code=2 挡住时是否主动注销挡路的旧会话（v2.6 起默认不做：踢掉后 NAS 要几分钟才释放，期间连本机都登不上） |
 | `CLEAR_OTHER_DEVICES` | `False` | `CLEAR_SESSIONS=True` 时，是否连账号上其它在线设备一起注销；`False` = 只清本机的 |
 | `PROBE_TIMEOUT` / `PROBE_BUDGET` | `5` / `12` | 单个探测地址的超时 / 一轮探测的总预算（秒） |
@@ -321,6 +322,15 @@ git fetch origin; git reset origin/main      # 用远端 HEAD 对齐历史，工
   只想用有线就什么都不用做。另外，账号被别的设备（手机 / 另一台电脑）占着时，
   本机无论走哪条链路都会被拒 —— 这时工具只报状态、不再去踢别人的设备，
   等那台设备断开或 NAS 自己释放（几分钟）就会自动恢复。
+* **「手动能连、自动连不上」的真相**（v2.7）：账号上还挂着旧会话时，Portal 一直回 `err_code=2`，
+  **NAS 真正释放它要几分钟**（实测 2~10 分钟）。手动在浏览器里点「登录」能成功，多半只是
+  「多按了几次、等到了那一刻」—— 网页版在收到 `ip_already_online_error` 时也只是
+  `logout()` 完再 `login()`（Portal.js 的 `reAuth()`），并不会让 NAS 立刻放行。
+  但界面版的默认重试是 8 次 × 8 秒 ≈ 1 分钟就放弃，**比 NAS 释放得还早**，于是看起来就是
+  「手动行、自动不行」。v2.7 起：命中这种情况会进入 `CONFLICT_WAIT`（默认 300 秒）等待窗口，
+  每 `RETRY_INTERVAL` 秒探一次外网 + 试一次登录，**全程不注销、不踢任何会话**（踢了自己也要
+  跟着掉线几分钟，反而更慢），期间点「停止」可随时中止。
+  想手动复现网页那套「注销后再登录」，可以跑 `python autoconn.py --reauth`（会让本机掉线几秒到几分钟，慎用）。
 * **Wi-Fi 开关被关掉时会直接说清楚**（v2.6）：Windows 的 Wi-Fi 开关（或笔记本无线快捷键 / 飞行模式）
   把无线**软件**关掉后，`netsh wlan connect` 会直接报 **0x80342002**、扫描结果变空
   （`netsh wlan show interfaces` 显示「无线电状态：硬件 开 / 软件 关」）。以前日志只会说

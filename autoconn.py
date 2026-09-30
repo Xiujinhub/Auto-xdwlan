@@ -18,6 +18,7 @@ https://w.xidian.edu.cn/srun_portal_pc?ac_id=1&theme=pro ，认证流程为：
     python autoconn.py --pppoe    只做"网线拨号（PPPoE）"，条目会自动创建
     python autoconn.py --pppoe-down  断开网线拨号
     python autoconn.py --logout   注销当前登录（用于验证脚本是否真的能上/下线）
+    python autoconn.py --reauth   注销本机 IP 上的旧会话后立刻重新登录（等同门户网页的"注销再登录"）
     python autoconn.py --verbose  打印请求细节，方便排查问题
 
 三条上网路径（脚本按顺序自动选择，全部失败才放弃）：
@@ -145,6 +146,14 @@ RETRY_INTERVAL = 15
 #       CLEAR_OTHER_DEVICES = False 只清「看起来是本机」的会话（网卡 IP / OS 名对得上）
 CLEAR_SESSIONS = False
 CLEAR_OTHER_DEVICES = False
+
+# ---------- 被「已有在线会话」挡住时的等待时长 ----------
+# 账号在别处（另一台设备 / 本机另一条链路 / 刚被踢过）还有在线会话时，Portal 会回 err_code=2，
+# 而 NAS 真正释放这条会话通常要几分钟。手动在浏览器里登录能成功，往往就是"多按了几次、等到了"。
+# 所以这里给一个专门的等待窗口：这段时间里每隔 RETRY_INTERVAL 探一次外网、试一次登录，
+# 期间**不注销、不踢任何会话**（踢了自己也要跟着掉线，反而更慢）。
+# 界面版点「停止」可以随时中止这段等待。
+CONFLICT_WAIT = 300
 
 # ---------- 无线网络（Wi-Fi）自动连接 ----------
 # 脚本发现"Portal 不可达"时会自动去找并连接这个 SSID，然后继续认证
@@ -779,7 +788,9 @@ def kick_session(ip=''):
     if not target or target == '::':
         return False, '没有查到需要清理的旧会话'
     now = int(time.time())
-    sign = sha1_hex(str(now) + USERNAME + target + '1' + str(now))
+    # 签名要和门户网页一致（Portal.js：sha1(time + username + ip + unbind + time)），
+    # 其中 username 是「学号 + 运营商后缀」，所以这里也带上 DOMAIN。
+    sign = sha1_hex(str(now) + USERNAME + DOMAIN + target + '1' + str(now))
     try:
         result = _api_get(session, '/cgi-bin/rad_user_dm', {
             'ip': target,
@@ -982,6 +993,39 @@ def _report_session_conflict():
         log('按默认配置不动这些会话（CLEAR_SESSIONS=False）：是本机的就先停掉那条链路'
             '（拔网线 / 断开拨号 / 关无线），是别的设备的就到那台设备上退出校园网'
             '（或去 zfw.xidian.edu.cn 踢掉）；NAS 释放旧会话一般要几分钟，等一会儿会自动恢复')
+
+
+def reauth_once():
+    """「先注销本机旧会话，再立刻重新登录」——对齐门户网页 Portal.js 的 reAuth()。
+
+    网页的实际行为（Portal.js 的 reAuth / sendLogout / login）：
+        登录返回 ip_already_online_error / err_code=2 时 → logout()：先对本机当前 IP 调
+        rad_user_dm（unbind=1）**再调 action=logout**（两步都做）→ 然后**马上重新 login()**。
+    实测差别：只做 rad_user_dm（设备下线）时，Portal 的「在线设备」列表立刻空了，但 NAS 上的
+    计费会话还会挂几分钟，这期间重新登录一直回 err_code=2；网页那套「下线 + 注销」把会话真正
+    清干净，所以浏览器里手动登录一按就成。
+    这里只动**本机自己的 IP**（不动账号上别人的设备），返回 (是否成功, 说明)。
+    """
+    notes = []
+    target = ''
+    try:
+        info = get_online_info(new_session())
+        target = str(info.get('online_ip') or '')
+    except Exception as error:
+        debug('查询本机在线 IP 失败: %s' % error)
+    if not target:
+        target = campus_source_ip()
+    if target:
+        # 两步都做，和网页一致：rad_user_dm 下线 + action=logout 注销
+        ok, message = kick_session(target)
+        notes.append('设备下线 %s：%s' % (target, message))
+        ok2, message2 = logout(target)
+        notes.append('注销 %s：%s' % (target, message2))
+        if ok or ok2:
+            time.sleep(1)
+    ok, message = login()
+    notes.append(message)
+    return ok, '；'.join(notes)
 
 
 # ============================== 无线网络（Wi-Fi） ==============================
@@ -1837,6 +1881,8 @@ def auto_connect():
     wifi_ensured = False
     already_online = 0
     pppoe_done = False
+    conflict_waited = False      # 是否已经进入「等 NAS 释放旧会话」的等待（只进一次）
+    conflict_reported = False    # 是否已把「账号被谁占着」写进日志（同样的内容只写一次）
     for attempt in range(1, MAX_RETRY + 1):
         if STOP_REQUESTED:
             log('已按请求停止本次连接（界面里点了「停止」）')
@@ -1894,13 +1940,12 @@ def auto_connect():
         else:
             log('第 %d 次登录失败：%s' % (attempt, message))
 
-        # 「已有在线会话」类失败要分三种情况处理：
-        #   * 外网已经通了（例如网线拨号 PPPoE 正好恢复了）→ 按成功处理，绝不踢会话；
-        #   * 外网不通，但本机的链路是断的（拨号掉线 / 没连 Wi-Fi）→ 先把链路接回来，
-        #     断网测试时最常见的就是这一种：Portal 能到（校园网里哪都到得了它），
-        #     可网线拨号已经掉线，这时候光重试 Portal 认证永远登不上去；
-        #   * 链路没问题还是被拒 → 是账号上残留的旧会话挡着，把它们注销掉再重登
-        #     （这一步要尽快走到：每多探一轮外网就多等十几秒，用户会以为脚本没反应）。
+        # 「已有在线会话」类失败按门户网页的做法处理（Portal.js 里的 reAuth()）：
+        #   * 外网已经通了（例如网线拨号 PPPoE 正好恢复了）→ 按成功处理，什么也别动；
+        #   * 外网不通、本机链路是断的（拨号掉线 / 没连 Wi-Fi）→ 先把链路接回来；
+        #   * 链路没问题还是被拒 → 先注销**本机 IP** 上的旧会话，再立刻重新登录一次
+        #     （浏览器里手动登录「一次就成功」就是这个原因：网页替我们做了这一步）；
+        #   * 还是被拒（挡路的会话在别的 IP / 别的设备上）→ 按配置决定要不要动「在线设备」列表。
         conflict = any(key in message for key in
                        ('code=2', '已在线', 'ip_already_online', '旧会话'))
         if conflict:
@@ -1918,6 +1963,35 @@ def auto_connect():
                 pppoe_done = pppoe_done or dial
                 if recover_link(attempt, dial=dial):
                     return 0
+            # 第一步（非破坏性）：挡路的旧会话要等 NAS 释放（一般几分钟）。这期间像用户手动
+            # 反复点「登录」那样：每隔 RETRY_INTERVAL 探一次外网、试一次登录，直到 CONFLICT_WAIT 秒。
+            # **不去踢会话** —— 实测踢掉本机自己的会话后，本机也要跟着掉线几分钟，反而更慢
+            # （v2.6 曾经自动踢，实测更糟，v2.7 改成只等不踢）。
+            if not conflict_waited:
+                conflict_waited = True
+                conflict_deadline = time.time() + CONFLICT_WAIT
+                log('账号上还有旧会话 → 等 NAS 自己释放（最多 %d 秒），期间每 %d 秒重试一次…'
+                    % (CONFLICT_WAIT, RETRY_INTERVAL))
+                while not STOP_REQUESTED and time.time() < conflict_deadline:
+                    time.sleep(RETRY_INTERVAL)
+                    connected, detail = check_internet()
+                    if connected:
+                        log('外网已恢复（%s）' % detail)
+                        return 0
+                    elapsed = int(CONFLICT_WAIT - max(0.0, conflict_deadline - time.time()))
+                    ok, message = login()
+                    log('等待中第 %d 秒：%s' % (elapsed, message))
+                    if ok:
+                        time.sleep(2)
+                        connected, detail = check_internet()
+                        if connected:
+                            log('联网验证通过（%s）' % detail)
+                            return 0
+                if STOP_REQUESTED:
+                    log('已按请求停止本次连接（界面里点了「停止」）')
+                    return 1
+                log('等了 %d 秒 NAS 还没释放旧会话，继续按正常间隔重试' % CONFLICT_WAIT)
+            # 第二步：还是被拒 → 按「在线设备」列表清旧会话（勾了 CLEAR_SESSIONS 才做）
             if CLEAR_SESSIONS and not kicked:
                 kicked = True
                 # 拨号还连着、而且校园网这一段是活的（门户按 IP 能应答）→ 说明问题不在
@@ -1937,9 +2011,10 @@ def auto_connect():
                             log('清理旧会话后已能上网（%s）' % detail)
                             return 0
                         continue
-            elif not CLEAR_SESSIONS:
+            elif not CLEAR_SESSIONS and not conflict_reported:
                 # 默认不动这些会话（见文件开头 CLEAR_SESSIONS 的说明）：先把「账号被谁占着」
                 # 写清楚，再按间隔等 NAS 自己释放。
+                conflict_reported = True
                 _report_session_conflict()
                 # 有线在手的话，顺手试一次网线拨号：拨号与 Portal 共用同一套账号，
                 # 但换个认证通道，说不定能通（实测这个墙口能拨号）。只试一次，
@@ -1973,6 +2048,9 @@ def main(argv=None):
                         help='强制登录一次（不判断当前是否已经在线）')
     parser.add_argument('--logout', action='store_true',
                         help='注销当前登录（把网断掉，用于验证）')
+    parser.add_argument('--reauth', action='store_true',
+                        help='注销本机 IP 上的旧会话后立刻重新登录（等同门户网页的「注销后再登录」；'
+                             '本机这次会掉线几秒到几分钟，慎用）')
     parser.add_argument('--wifi', action='store_true',
                         help='只执行"连上 WIFI_SSID 指定的无线网"这一步')
     parser.add_argument('--pppoe', action='store_true',
@@ -2026,6 +2104,11 @@ def main(argv=None):
         log('当前 Wi-Fi: %s' % (wifi_current_ssid() or '未连接'))
         ok, message = connect_wifi(verbose=True)
         log('Wi-Fi 连接结果: %s（%s）' % (ok, message))
+        return 0 if ok else 1
+
+    if args.reauth:
+        ok, message = reauth_once()
+        log('重新认证: %s（%s）' % (ok, message))
         return 0 if ok else 1
 
     if args.logout:

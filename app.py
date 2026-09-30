@@ -32,7 +32,7 @@ import autoconn
 
 APP_NAME = 'Auto-xdwlan'
 APP_TITLE = '西电校园网自动连接'
-APP_VERSION = '2.6'
+APP_VERSION = '2.7'
 SETTINGS_FILE = 'settings.json'
 LOCAL_SERVER = 'Auto-xdwlan-gui'
 
@@ -251,6 +251,7 @@ def apply_settings(data):
     autoconn.PPPOE_PASSWORD = ''
     autoconn.MAX_RETRY = 8       # 界面里不要长时间卡着（配合「停止」按钮）
     autoconn.RETRY_INTERVAL = 8
+    autoconn.CONFLICT_WAIT = 300  # 被「已有在线会话」挡住时等 NAS 释放的窗口（可随时「停止」）
     autoconn.REQUEST_TIMEOUT = 8
     autoconn.LOG_FILE = None  # 不写日志文件
 
