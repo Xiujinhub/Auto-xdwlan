@@ -32,7 +32,7 @@ import autoconn
 
 APP_NAME = 'Auto-xdwlan'
 APP_TITLE = '西电校园网自动连接'
-APP_VERSION = '2.9'
+APP_VERSION = '2.10'
 SETTINGS_FILE = 'settings.json'
 LOCAL_SERVER = 'Auto-xdwlan-gui'
 
@@ -506,7 +506,7 @@ QPushButton#Ghost:hover { border-color: #38A9FF; color: #D7EBFF; background-colo
 QPushButton#Ghost:disabled { color: #5B7B99; border-color: #1B3A5C; }
 QPushButton#Tiny {
     background: transparent; border: 1px solid #24557F; color: #9CC6E8;
-    border-radius: 7px; padding: 3px 9px; font-size: 11.5px;
+    border-radius: 7px; padding: 3px 8px; font-size: 11.5px;
 }
 QPushButton#Tiny:hover { border-color: #38A9FF; color: #D7EBFF; }
 QToolButton#Link {
@@ -634,10 +634,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setWindowTitle('%s · %s' % (APP_NAME, APP_TITLE))
         self.setWindowFlags(QtCore.Qt.FramelessWindowHint | QtCore.Qt.Window)
         self.setAttribute(QtCore.Qt.WA_TranslucentBackground)
-        self.setMinimumSize(420, 500)
+        self.setMinimumSize(470, 500)
         available = QtWidgets.QApplication.primaryScreen().availableGeometry()
-        height = min(690, max(500, available.height() - 60))
-        width = min(470, max(420, available.width() - 60))
+        height = min(700, max(500, available.height() - 60))
+        width = min(500, max(470, available.width() - 60))
         self.resize(width, height)
         self.move(available.center() - self.rect().center())
         if os.path.exists(ICON_PATH):
@@ -734,6 +734,7 @@ class MainWindow(QtWidgets.QMainWindow):
         minimize = QtWidgets.QToolButton()
         minimize.setObjectName('WinBtn')
         minimize.setText('—')
+        minimize.setFixedWidth(32)
         minimize.setToolTip('最小化到托盘')
         minimize.setCursor(QtCore.Qt.PointingHandCursor)
         minimize.clicked.connect(self.hide_to_tray)
@@ -742,6 +743,7 @@ class MainWindow(QtWidgets.QMainWindow):
         close = QtWidgets.QToolButton()
         close.setObjectName('WinBtnClose')
         close.setText('✕')
+        close.setFixedWidth(32)
         close.setToolTip('关闭（后台运行时最小化到托盘）')
         close.setCursor(QtCore.Qt.PointingHandCursor)
         close.clicked.connect(self.close)
@@ -775,14 +777,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.connect_btn = QtWidgets.QPushButton('立即连接')
         self.connect_btn.setObjectName('Primary')
         self.connect_btn.setCursor(QtCore.Qt.PointingHandCursor)
-        self.connect_btn.setFixedWidth(84)
+        self.connect_btn.setFixedWidth(92)
         self.connect_btn.clicked.connect(lambda: self.start_job('connect'))
         top.addWidget(self.connect_btn)
 
         self.refresh_btn = QtWidgets.QPushButton('刷新')
         self.refresh_btn.setObjectName('Ghost')
         self.refresh_btn.setCursor(QtCore.Qt.PointingHandCursor)
-        self.refresh_btn.setFixedWidth(48)
+        self.refresh_btn.setFixedWidth(52)
         self.refresh_btn.clicked.connect(lambda: self.start_job('check'))
         top.addWidget(self.refresh_btn)
         card.body.addLayout(top)
@@ -796,14 +798,16 @@ class MainWindow(QtWidgets.QMainWindow):
         for index, (left_key, left_attr, right_key, right_attr) in enumerate(rows):
             grid.addWidget(field_label(left_key, 'FieldKey'), index, 0)
             left = field_label('—')
+            left.setWordWrap(True)          # 无线名等偶尔很长：宁可换行也别被截掉
             setattr(self, 'value_' + left_attr, left)
             grid.addWidget(left, index, 1)
             grid.addWidget(field_label(right_key, 'FieldKey'), index, 2)
             right = field_label('—')
+            right.setWordWrap(True)
             setattr(self, 'value_' + right_attr, right)
             grid.addWidget(right, index, 3)
-        grid.setColumnMinimumWidth(0, 54)
-        grid.setColumnMinimumWidth(2, 54)
+        grid.setColumnMinimumWidth(0, 56)
+        grid.setColumnMinimumWidth(2, 56)
         grid.setColumnStretch(1, 3)
         grid.setColumnStretch(3, 2)
         card.body.addLayout(grid)
@@ -837,21 +841,22 @@ class MainWindow(QtWidgets.QMainWindow):
 
         grid.addWidget(field_label('账号', 'FieldKey'), 0, 0)
         self.username_edit = QtWidgets.QLineEdit(self.settings.get('username', ''))
-        self.username_edit.setPlaceholderText('学号（统一身份认证账号）')
+        self.username_edit.setPlaceholderText('学号')
+        self.username_edit.setToolTip('统一身份认证账号（西电学号，11 位数字）')
         self.username_edit.setMinimumWidth(64)
         grid.addWidget(self.username_edit, 0, 1)
 
         grid.addWidget(field_label('密码', 'FieldKey'), 0, 2)
         self.password_edit = QtWidgets.QLineEdit(self.settings.get('password', ''))
         self.password_edit.setEchoMode(QtWidgets.QLineEdit.Password)
-        self.password_edit.setPlaceholderText('校园网密码')
+        self.password_edit.setPlaceholderText('密码')
         self.password_edit.setMinimumWidth(64)
         grid.addWidget(self.password_edit, 0, 3)
         self.show_password_btn = QtWidgets.QPushButton('显示')
         self.show_password_btn.setObjectName('Tiny')
         self.show_password_btn.setCheckable(True)
         self.show_password_btn.setCursor(QtCore.Qt.PointingHandCursor)
-        self.show_password_btn.setFixedWidth(38)
+        self.show_password_btn.setFixedWidth(46)
         self.show_password_btn.toggled.connect(self._toggle_password)
         grid.addWidget(self.show_password_btn, 0, 4)
 
@@ -938,13 +943,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.reconnect_check = QtWidgets.QCheckBox('断线自动重连')
         self.reconnect_check.setChecked(bool(self.settings.get('auto_reconnect', True)))
         row3.addWidget(self.reconnect_check)
-        row3.addWidget(field_label('每', 'FieldKey'))
+        every = field_label('每', 'FieldKey')
+        every.setMinimumWidth(16)
+        row3.addWidget(every)
         self.interval_spin = QtWidgets.QSpinBox()
         self.interval_spin.setRange(1, 240)
-        self.interval_spin.setSuffix(' 分钟')
         self.interval_spin.setValue(int(self.settings.get('reconnect_minutes', 10) or 10))
-        self.interval_spin.setFixedWidth(84)
+        self.interval_spin.setFixedWidth(64)
+        self.interval_spin.setToolTip('断线后每隔多少分钟重连一次（1~240 分钟）')
         row3.addWidget(self.interval_spin)
+        row3.addWidget(field_label('分钟', 'FieldKey'))
         row3.addStretch(1)
 
         self.advanced_btn = QtWidgets.QToolButton()
@@ -983,7 +991,9 @@ class MainWindow(QtWidgets.QMainWindow):
         head = QtWidgets.QHBoxLayout()
         head.setSpacing(8)
         head.addWidget(field_label('运行日志', 'CardTitle'))
-        head.addWidget(field_label('仅界面显示，不写文件', 'Hint'))
+        hint = field_label('不写文件', 'Hint')
+        hint.setToolTip('运行日志只显示在这个窗口里，不写日志文件（只有内部异常才追加 crash.log）')
+        head.addWidget(hint)
         head.addStretch(1)
         self.clear_log_btn = QtWidgets.QPushButton('清空')
         self.clear_log_btn.setObjectName('Tiny')
