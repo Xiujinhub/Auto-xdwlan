@@ -482,7 +482,7 @@ def check_internet():
         单个地址抽风不能当成"断网"，否则会白白把正在用的拨号拆掉重拨；
       * 一轮探测有时间预算（PROBE_BUDGET），离线时不至于卡很久。
     """
-    global _LAST_PROBE_SUMMARY
+    global _LAST_PROBE_SUMMARY, _LAST_INTERNET_RESULT
     deadline = time.time() + PROBE_BUDGET
     reasons = []
     for url, expect_status in INTERNET_PROBES:
@@ -490,6 +490,7 @@ def check_internet():
         ok, reason = _probe_internet(url, expect_status, timeout)
         if ok:
             _LAST_PROBE_SUMMARY = None      # 恢复联网后，下次失败要重新报原因
+            _LAST_INTERNET_RESULT = (True, reason, time.time())
             return True, reason
         debug('外网探测 %s 不通: %s' % (url, reason))
         reasons.append('%s %s' % (_short_host(url), reason))
@@ -500,12 +501,30 @@ def check_internet():
     if summary != _LAST_PROBE_SUMMARY:      # 同样的原因不重复刷屏
         _LAST_PROBE_SUMMARY = summary
         log('外网探测都没通过：%s' % summary)
+    _LAST_INTERNET_RESULT = (False, summary, time.time())
     return False, '外网不通（%d 个探测地址都没通，原因见运行日志）' % len(INTERNET_PROBES)
 
 
 # 门户域名上次解析到的 IP：用来做「不依赖 DNS」的校园网活性检查
 _PORTAL_LAST_IP = ''
 _LAST_PROBE_SUMMARY = None
+# 最近一次外网探测的结果 (是否通, 说明, 时间戳)：给 last_internet_result() 复用
+_LAST_INTERNET_RESULT = None
+
+
+def last_internet_result(max_age=15):
+    """复用最近一次外网探测的结果（不超过 max_age 秒），没有新鲜的就返回 None。
+
+    用途：login() 遇到「已有在线会话」时必须先探一次外网（不通才算失败），紧接着
+    auto_connect 又要判断「外网是不是刚好恢复了」。以前这里会再整轮探一遍 ——
+    离线时每轮最多 12 秒（PROBE_BUDGET），重连因此白等十几秒，看起来就像「卡住不动」。
+    """
+    if not _LAST_INTERNET_RESULT:
+        return None
+    ok, detail, when = _LAST_INTERNET_RESULT
+    if time.time() - when > max_age:
+        return None
+    return ok, detail
 
 
 def _remember_portal_ip():
@@ -952,6 +971,48 @@ def wifi_network_visible(ssid):
     return False
 
 
+def wifi_interface_present():
+    """本机有没有可用的无线接口（netsh 的接口列表里有没有接口条目）。
+
+    中英文输出里都有一行 ASCII 的 'GUID'，只认它 —— 不解析任何本地化文字，
+    免得踩编码坑。
+    """
+    text = _netsh(['wlan', 'show', 'interfaces'])
+    return any(line.strip().startswith('GUID') for line in text.splitlines())
+
+
+def wifi_scan_ssids():
+    """本次扫描结果里的 SSID 集合（netsh 的结果带缓存，可能为空 = 还不知道）。"""
+    found = set()
+    for line in _netsh(['wlan', 'show', 'networks']).splitlines():
+        key, sep, value = line.partition(':')
+        # 'SSID 1 : xxx' 才是网络名；'BSSID 1 : xx:xx...' 不算
+        if sep and key.strip().startswith('SSID') and value.strip():
+            found.add(value.strip())
+    return found
+
+
+def needs_wifi():
+    """外网不通时，要不要主动去把无线连到 WIFI_SSID 上。
+
+    以前只在「Portal 不可达」时才连无线，于是「无线连在别的网 / 干脆没连无线、
+    但校园网门户仍然可达」这种情形下，脚本永远不会去连 Wi-Fi（用户只能手动点）。
+
+    这里只在**扫描结果里确实能看到 WIFI_SSID** 时才动手：既保证「在校园里但没连
+    校园网」会被自动接上，又不会在家/在别的网络（扫不到 stu-xdwlan）时把正在用的
+    无线拆掉。
+    """
+    if not WIFI_SSID or not WIFI_AUTO_CONNECT:
+        return False
+    if wifi_current_ssid() == WIFI_SSID:      # 已经连在校园网上，不用管
+        return False
+    if not wifi_interface_present():          # 没有无线网卡（或被禁用），别折腾
+        return False
+    if WIFI_SSID not in wifi_scan_ssids():    # 扫都扫不到 = 不在覆盖范围
+        return False
+    return True
+
+
 def _quote(value):
     """SSID 里带空格时 netsh 需要引号。"""
     return '"%s"' % value if ' ' in value else value
@@ -986,8 +1047,27 @@ def _add_open_profile(ssid):
     return wifi_profile_exists(ssid), 'add profile'
 
 
-def connect_wifi(ssid=None, wait=None, verbose=True):
-    """确保 Wi-Fi 连到指定 SSID（默认 stu-xdwlan）。返回 (是否已连上, 说明)。"""
+def _wifi_connect_once(ssid, wait, label=''):
+    """执行一次 wlan connect 并等到关联成功。返回实际等待秒数；超时返回 None。"""
+    output = _netsh(['wlan', 'connect', 'name=%s' % _quote(ssid), 'ssid=%s' % _quote(ssid)])
+    debug('wlan connect 输出: %s' % output.strip()[:200])
+    waited = 0
+    while waited < wait:
+        time.sleep(2)
+        waited += 2
+        if wifi_current_ssid() == ssid:
+            log('%s已连上 Wi-Fi %s（等待 %d 秒）' % (label, ssid, waited))
+            return waited
+    return None
+
+
+def connect_wifi(ssid=None, wait=None, verbose=True, retry=True):
+    """确保 Wi-Fi 连到指定 SSID（默认 stu-xdwlan）。返回 (是否已连上, 说明)。
+
+    retry=True：第一次超时后，如果当前**什么都没连上**，就先断开再重连一次。
+    （Realtek 这类网卡偶发「关联时被驱动程序断开」的半死状态，重连一次往往就好了；
+    只在本来就没连着任何网络时才拆，不会把正在用的无线断掉。）
+    """
     ssid = ssid if ssid is not None else WIFI_SSID
     wait = wait or WIFI_CONNECT_WAIT
     if not ssid:
@@ -1007,6 +1087,9 @@ def connect_wifi(ssid=None, wait=None, verbose=True):
         if verbose:
             log('Wi-Fi 未连接，尝试连接 %s …' % ssid)
 
+    if not wifi_interface_present():
+        return False, '本机没有可用的无线接口（无线网卡被禁用，或者 WLAN 服务没启动）'
+
     if not wifi_profile_exists(ssid):
         log('系统里没有 %s 的无线配置文件，尝试自动创建' % ssid)
         if not wifi_network_visible(ssid):
@@ -1020,18 +1103,22 @@ def connect_wifi(ssid=None, wait=None, verbose=True):
         # 但按配置连接本身是能成的（连不上会自然超时，不必事先拦着）。
         debug('本次扫描没列出 %s，但系统里已有配置，直接尝试连接' % ssid)
 
-    output = _netsh(['wlan', 'connect', 'name=%s' % _quote(ssid), 'ssid=%s' % _quote(ssid)])
-    debug('wlan connect 输出: %s' % output.strip()[:200])
+    if _wifi_connect_once(ssid, wait) is not None:
+        return True, '已连接 %s' % ssid
 
-    waited = 0
-    while waited < wait:
+    if retry and not wifi_current_ssid():
+        # 超时、而且现在什么都没连上：多半是网卡/驱动卡在「关联不上」的状态
+        # （事件日志里是「关联时驱动程序已断开连接」这种）。断开再重连一次，
+        # 这次只等一半时间；本来连着别的网络时不走这条路，免得把在用的无线拆了。
+        log('连接 %s 超时，先断开无线再重连一次…' % ssid)
+        _netsh(['wlan', 'disconnect'])
         time.sleep(2)
-        waited += 2
-        if wifi_current_ssid() == ssid:
-            log('已连上 Wi-Fi %s（等待 %d 秒）' % (ssid, waited))
-            return True, '已连接 %s' % ssid
-    return False, ('连接 %s 超时（%d 秒）：可能信号弱 / 不在覆盖范围 / 配置不对'
-                   '（加 --verbose 能看到 netsh 的原始输出）' % (ssid, wait))
+        if _wifi_connect_once(ssid, max(10, wait // 2), label='重连后') is not None:
+            return True, '已连接 %s（断开重连后）' % ssid
+
+    return False, ('连接 %s 超时（%d 秒）：可能信号弱 / 不在覆盖范围 / 配置不对；'
+                   '当前无线：%s（加 --verbose 能看到 netsh 的原始输出）'
+                   % (ssid, wait, wifi_current_ssid() or '未连接'))
 
 
 # ============================== 有线拨号（PPPoE） ==============================
@@ -1491,6 +1578,27 @@ def ensure_pppoe(allow_redial=True):
     return ok, message
 
 
+def link_looks_usable():
+    """本机是不是已经有一条能到校园网的链路。
+
+    判断依据（任意一条成立即可）：有拨号在线 / 无线连在目标 SSID 上 / 有线拿到可用 IP。
+    用途：Portal 已经应答过（说明「校园网这一段」是通的）时，判断还要不要再花时间
+    「恢复链路」—— 链路本来就在的话，直接去清旧会话重登就行，能省下十几秒。
+    """
+    try:
+        if active_dial_connections():
+            return True
+    except Exception as error:
+        debug('查询拨号状态失败: %s' % error)
+    if WIFI_SSID and wifi_current_ssid() == WIFI_SSID:
+        return True
+    try:
+        return ethernet_has_ipv4()
+    except Exception as error:
+        debug('查询有线网卡 IP 失败: %s' % error)
+        return False
+
+
 def recover_link(attempt=1, dial=True):
     """断网后重新建立链路：先网线拨号（PPPoE），还不行再连 Wi-Fi。返回是否已能上网。
 
@@ -1533,10 +1641,16 @@ def auto_connect():
     online_user = who_is_online(session)
     if online_user:
         log('Portal 记录显示 %s 已在线' % online_user)
+    # 先把本机当前走的是哪条链路写进日志：以后排查「自动连不上」时，一眼就能看出是
+    # 「无线没连上」还是「连上了但认证被拒」，不用再靠猜（这次的问题就出在这里）。
+    log('本机当前链路：无线=%s，拨号=%s'
+        % (wifi_current_ssid() or '未连接',
+           '、'.join(active_dial_connections()) or '无'))
 
     kicked = False
     link_recovered = False
     wifi_tried = False
+    wifi_ensured = False
     already_online = 0
     pppoe_done = False
     for attempt in range(1, MAX_RETRY + 1):
@@ -1547,6 +1661,14 @@ def auto_connect():
         if connected:
             log('网络已连通（%s），第 %d 次检查，无需登录' % (detail, attempt))
             return 0
+
+        # 外网确实不通时，先确认无线连的就是校园网：以前只有「Portal 不可达」那一支会
+        # 连 Wi-Fi，于是「无线连在别的网上 / 根本没连无线，但门户仍然可达」时，脚本
+        # 永远不会去连 WIFI_SSID（用户只能自己点一下）。这里补上，每轮只做一次。
+        if not wifi_ensured and needs_wifi():
+            wifi_ensured = True
+            if use_wifi(attempt):
+                return 0
 
         # Portal 不可达通常意味着链路层没通：先试网线拨号，再试 Wi-Fi
         # （拨号整个流程只做一次，Wi-Fi 每轮都可以再试）
@@ -1593,15 +1715,20 @@ def auto_connect():
         #   * 外网不通，但本机的链路是断的（拨号掉线 / 没连 Wi-Fi）→ 先把链路接回来，
         #     断网测试时最常见的就是这一种：Portal 能到（校园网里哪都到得了它），
         #     可网线拨号已经掉线，这时候光重试 Portal 认证永远登不上去；
-        #   * 链路没问题还是被拒 → 是账号上残留的旧会话挡着，把它们注销掉再重登。
+        #   * 链路没问题还是被拒 → 是账号上残留的旧会话挡着，把它们注销掉再重登
+        #     （这一步要尽快走到：每多探一轮外网就多等十几秒，用户会以为脚本没反应）。
         conflict = any(key in message for key in
                        ('code=2', '已在线', 'ip_already_online', '旧会话'))
         if conflict:
-            connected, detail = check_internet()
+            # login() 里刚探过一次外网（遇到「已有在线会话」时必须先确认外网通不通），
+            # 这里直接复用那个结果；以前会再整轮探一遍，离线时每轮最多 12 秒白等。
+            connected, detail = last_internet_result() or check_internet()
             if connected:
                 log('Portal 提示已有在线会话，但外网已恢复（%s），按成功处理' % detail)
                 return 0
-            if not link_recovered:
+            # 本机链路本来就在（无线连在校园网上 / 拨号在线 / 有线有可用 IP）时不必
+            # 「恢复链路」：Portal 都能应答，说明路是通的，直接清旧会话重登更快。
+            if not link_recovered and not link_looks_usable():
                 link_recovered = True
                 dial = not pppoe_done and PPPOE_ENABLE
                 pppoe_done = pppoe_done or dial
@@ -1615,6 +1742,7 @@ def auto_connect():
                 if active_dial_connections() and campus_link_alive() is True:
                     log('拨号还在、校园网链路也活着 → 先不注销会话（免得把正在用的连接踢断），等下一轮再试')
                 else:
+                    log('登录被拒（账号上已有在线会话），开始注销挡路的旧会话…')
                     cleared, kick_message = clear_stale_sessions()
                     log('清理旧会话：%s' % kick_message)
                     if cleared:

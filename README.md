@@ -109,6 +109,9 @@ XXTEA 用的自定义 base64 字母表（与门户前端 `Portal.js` 一致）�
 查一次 Portal 在线账号（仅记录）
 for attempt in 1..MAX_RETRY(20):
     check_internet() 能通 → 成功退出(0)
+    外网不通时：无线没连在 WIFI_SSID 上、而扫描结果里确实有它 → 先换上 Wi-Fi 再看能不能上网
+                （v2.5 新增：以前只有「Portal 不可达」那一支才会连 Wi-Fi，于是「连在别的网上、
+                  Portal 又可达」时脚本永远不会去连校园网）；扫不到校园网（在家的场景）不动无线
     Portal 不可达时：
         先试一次网线拨号（PPPoE）→ 通了就退出
         还不可达 → 连 Wi-Fi(stu-xdwlan) + 等网关就绪（最多 30 秒）
@@ -117,7 +120,10 @@ for attempt in 1..MAX_RETRY(20):
     提交 login()：成功则等 2 秒再验外网 → 通就退出
         若返回 err_code=2 / ip_already_online（本机或账号已有在线会话）：
             外网已通 → 直接按成功算（网线拨号 PPPoE 在线时必然遇到，不用重复认证）
-            外网不通 → 先恢复本机链路（重拨 / 连 Wi-Fi，一次）—— 断网测试最常见的就是这种：
+            外网不通 → 链路本来就在（无线连在校园网 / 拨号在线 / 有线有可用 IP）时直接清旧会话重登：
+                       复用 login() 里刚探过的外网结果、跳过一遍「恢复链路」（v2.5：这两步原来各要
+                       十几秒，表现就是「日志半天不动、只能手动去浏览器登录」）
+                       链路确实断了才先恢复本机链路（重拨 / 连 Wi-Fi，一次）—— 断网测试最常见的就是这种：
                        Portal 哪都能到，可拨号已经掉线，光重试 Portal 认证永远登不上去
                        但**拨号还连着时先别急着拆**：按 IP 直连门户（不依赖 DNS）看看校园网这一段
                        还活着吗 —— 活着说明只是外网/DNS/CDN 抽风，这次不重拨、也不注销会话；
@@ -190,8 +196,8 @@ D:\Anaconda\python.exe E:\code\Auto-xdwlan\app.py
 ### 4.3 重新打包 exe（改完 app.py / autoconn.py 后）
 
 ```powershell
-cd E:\code\Auto-xdwlan-main
-powershell -ExecutionPolicy Bypass -File .\build_exe.ps1 -Python D:\Anaconda\envs\paddle_env\python.exe
+cd E:\code\Auto-xdwlan
+powershell -ExecutionPolicy Bypass -File .\build_exe.ps1 -Python D:\Anaconda\python.exe
 Copy-Item .\dist\Auto-xdwlan.exe D:\Auto-xdwlan\ -Force      # 部署目录（exe 和 settings.json 都在这儿）
 ```
 
@@ -199,9 +205,10 @@ Copy-Item .\dist\Auto-xdwlan.exe D:\Auto-xdwlan\ -Force      # 部署目录（ex
 打包会把 `dist\` 整个重建，但脚本会自动把 `dist\settings.json` 备份到临时目录、打完再还原，
 所以界面里填过的账号密码不会丢。
 
-本机打包环境（2026-09 实测）：`D:\Anaconda\python.exe` 里**没有** PyInstaller，
-能用的解释器是 `D:\Anaconda\envs\paddle_env\python.exe`（Python 3.9 + PyQt5 5.15.9 + PyInstaller 6.16，
-打出来 ~40.8 MB）；`envs\tracker`（Python 3.7，和 README 里写的 3.7 + PyQt5 5.9.2 最接近）没有 PyQt5，打不了。
+本机打包环境（2026-09-30 实测）：直接用 `D:\Anaconda\python.exe`（Python 3.12.4 + PyQt5 5.15.10），
+缺 PyInstaller 时装一次即可：`python -m pip install pyinstaller`（本次装的是 6.22.3，打出来 ~57 MB）。
+以前用的 `D:\Anaconda\envs\paddle_env`（Python 3.9 + PyQt5 5.15.9 + PyInstaller 6.16，~40.8 MB）在本机已经不存在，
+`envs\tracker`（Python 3.7，和最早写的 3.7 + PyQt5 5.9.2 最接近）没有 PyQt5，打不了。
 注意两条命令不能粘成一行，PowerShell 会把整串当成一个文件名（`-File "…ps1Copy-Item"` 就是这个问题），
 要么换行，要么用 `;` 分隔。
 
@@ -257,6 +264,14 @@ git push            # 开着 Clash 代理即可
 * **平时不写日志文件**：运行日志只在界面窗口里显示（内存中），退出即清空；
   只有出现「内部异常」时才会在程序同目录追加 `crash.log`（完整 traceback，超 256 KB 自动滚成 `crash.log.old`），
   排查完可以直接删。
+* **自动连接不再「卡着不动」**（v2.5）：两处改动 ——
+  ① 「账号已有在线会话」（`err_code=2`）时，复用刚探过的外网结果、链路本来就在就跳过一遍「恢复链路」，
+     直接注销挡路的旧会话再重登，比原来快十几秒（原来要先整轮探外网、再做一遍恢复链路，才轮到清会话）；
+  ② 外网不通时也会主动确认无线连的是不是校园网（见 3.3）；「无线超时连不上、而且当前什么都没连着」
+     时先断开再重连一次（Realtek 网卡偶发「关联时被驱动程序断开」，重连一次通常就好），
+     本来连着别的网络时不会去拆它。
+  另外每次连接开始时日志会先写一行「本机当前链路：无线=…，拨号=…」，
+  方便一眼看出是「没连上」还是「连上了但认证被拒」。
 * **没网线 / 网线用不了时会自动改用 Wi-Fi**（v2.4）：以前无线只在 Portal 不可达时才连，
   网线插着（哪怕这个墙口只给拨号、根本做不了直连认证）时 Portal 照样可达 → 脚本一直死磕网线。
   现在「有网线也有可用 IP」这条路试过一轮仍上不去，就会去连 `WIFI_SSID`（默认 `stu-xdwlan`）再认证；
@@ -289,7 +304,8 @@ git push            # 开着 Clash 代理即可
 * **常见报错速查**：
   `E2620` = 账号在线设备数超限（去 `zfw.xidian.edu.cn` 踢设备）；
   `login_error + err_code=2` = 本机/账号已有在线会话（走网线拨号时必然出现）：外网通就无需再认证；
-  外网确实不通时，脚本会先把本机链路接回来（重拨 / 连 Wi-Fi），还不行才按「在线设备」列表清旧会话
+  外网确实不通时：链路本来就在就直接按「在线设备」列表清旧会话重登（v2.5 起不再重复探外网、
+  也不再重做一遍「恢复链路」）；链路断了才先把本机链路接回来（重拨 / 连 Wi-Fi），再按列表清旧会话
   （`CLEAR_OTHER_DEVICES=True` 时连账号上其它设备一起注销，日志里会写明动了哪些 IP；也可 `--logout` 手动清）；
   拨号 `623` = 系统已有「所有用户」的拨号本（手动在“设置 → 网络和 Internet → 拨号”里建一条宽带连接，脚本之后会自动复用）。
 * 机器上若还跑着第三方校园网客户端（例如 `D:\xdwlan-login\xdwlan-login.exe`），两者不冲突、功能有重叠，
