@@ -175,6 +175,11 @@ PPPOE_DIAL_TIMEOUT = 100     # 单次拨号最长等待秒数
 # 但实测这个墙口确实能拨号（rasdial 成功过），所以留一次尝试机会，
 # 失败原因（619 / 628 / 691 等）会原样打进日志，方便判断是「墙口不支持」还是「账号被占用」。
 PPPOE_FALLBACK = True
+# 拨号刚连上时给它多少秒把链路跑起来。这段时间里**绝不做 Portal 认证**：
+# 同一账号同一时刻只允许一条在线会话，Portal 一登上去，NAS 就会把拨号那条踢掉 ——
+# 实测现象就是「拨号刚连上 11~15 秒又断了」。给完时间还是不通，就把拨号断开、改走 Portal
+# （两边不要同时抢同一个账号）。
+DIAL_GRACE = 20
 
 # 单次 HTTP 请求超时（秒）
 REQUEST_TIMEOUT = 10
@@ -1883,6 +1888,7 @@ def auto_connect():
     pppoe_done = False
     conflict_waited = False      # 是否已经进入「等 NAS 释放旧会话」的等待（只进一次）
     conflict_reported = False    # 是否已把「账号被谁占着」写进日志（同样的内容只写一次）
+    dial_grace_done = False       # 是否已经给过「刚连上的拨号」一次不被 Portal 抢账号的机会
     for attempt in range(1, MAX_RETRY + 1):
         if STOP_REQUESTED:
             log('已按请求停止本次连接（界面里点了「停止」）')
@@ -1891,6 +1897,28 @@ def auto_connect():
         if connected:
             log('网络已连通（%s），第 %d 次检查，无需登录' % (detail, attempt))
             return 0
+
+        # 拨号刚连上时先别急着做 Portal 认证：同一账号只允许一条在线会话，Portal 一登上去
+        # NAS 就会把拨号踢掉（实测「拨号连上 11~15 秒又断」就是这么来的）。给它 DIAL_GRACE 秒；
+        # 还是不通就把拨号断开，明确改走 Portal，避免两边互相抢账号。
+        if not dial_grace_done and active_dial_connections():
+            dial_grace_done = True
+            dials = '、'.join(active_dial_connections())
+            log('检测到拨号已连接（%s）→ 先等 %d 秒让链路跑起来（这期间不做 Portal 认证，'
+                '否则会把拨号踢断）…' % (dials, DIAL_GRACE))
+            dial_deadline = time.time() + DIAL_GRACE
+            while not STOP_REQUESTED and time.time() < dial_deadline:
+                time.sleep(3)
+                connected, detail = check_internet()
+                if connected:
+                    log('拨号链路已能上网（%s），无需 Portal 认证' % detail)
+                    return 0
+            if STOP_REQUESTED:
+                log('已按请求停止本次连接（界面里点了「停止」）')
+                return 1
+            log('拨号连上了但外网仍不通 → 断开拨号，改走 Portal 认证（避免两边抢同一个账号）')
+            pppoe_hangup()
+            time.sleep(2)
 
         # 外网确实不通时，先确认无线连的就是校园网：以前只有「Portal 不可达」那一支会
         # 连 Wi-Fi，于是「无线连在别的网上 / 根本没连无线，但门户仍然可达」时，脚本
