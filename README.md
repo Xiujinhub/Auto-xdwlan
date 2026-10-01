@@ -308,9 +308,15 @@ git fetch origin; git reset origin/main      # 用远端 HEAD 对齐历史，工
 
 ## 五、注意事项
 
+* **当前版本 v2.11**（2026-10-01）：联网行为明确成「完全照手动操作」—— 能上外网就不动 → 插着网线就拨号
+  （网线这条路不通就换 Wi-Fi）→ 最后才做校园网认证；**默认不做任何「清 IP / 踢会话」动作**
+  （要用「▸ 高级」里的开关才会清，默认关闭）。本次发布把版本号从 v2.10 提到 v2.11
+  并用本机环境重新构建 exe（连网逻辑与 v2.10 相同），保证 `tag` / 源码 / `exe` 三者严格对应。
 * **依赖**：`requests`（命令行版）；界面版还需要 `PyQt5`（Anaconda 自带）；打包需要 `pyinstaller`。
-  当前打包环境：`D:\Anaconda\envs\paddle_env`（Python 3.9 + PyQt5 5.15.9 + PyInstaller 6.16），
-  见 4.3 —— 仓库最初是用 Python 3.7 + PyQt5 5.9.2 + PyInstaller 5.13.2 打的，那套环境本机已经没有。
+  **v2.11 的 exe 用的是这台机器（`E:\code`）的打包环境**：`D:\Anaconda\python.exe`
+  = Python 3.7.0 + PyQt5 5.9.2 + PyInstaller 5.13.2 + requests 2.19.1（见 4.3）。
+  另一台机器上用的是 `D:\Anaconda\envs\paddle_env`（Python 3.9 + PyQt5 5.15.9 + PyInstaller 6.16，打出来更小），
+  但那套环境在本机不存在；两边源码完全相同，exe 体积差异只来自打包环境。
 * **平时不写日志文件**：运行日志只在界面窗口里显示（内存中），退出即清空；
   只有出现「内部异常」时才会在程序同目录追加 `crash.log`（完整 traceback，超 256 KB 自动滚成 `crash.log.old`），
   排查完可以直接删。
