@@ -739,11 +739,11 @@ def _explain_error(result):
     if code in known:
         return '%s（%s）' % (known[code], message)
     if _looks_like_err_code_2(message):
-        return ('INFO Error，err_code=2：账号 %s 已经有一条在线会话 —— 西电同一账号同一时刻'
-                '只允许一条（有线直连 / 网线拨号 / 无线共用同一套账号）。是本机的就先把那条'
-                '链路停掉（拔网线 / 断开拨号 / 关无线），是别的设备的就到那台设备上退出校园网'
-                '（或去 zfw.xidian.edu.cn 踢掉）；刚踢过会话的话，NAS 要几分钟才释放，'
-                '这期间登录都会是这个错' % (USERNAME + DOMAIN))
+        return ('INFO Error，err_code=2：账号 %s 已经有一条在线会话 —— 同一账号同一时刻只允许一条'
+                '（有线直连 / 拨号 / 无线共用同一套账号）。**本程序不会去踢任何设备**。'
+                '可行的办法：① 插上网线让本程序拨号（拨号走另一套认证通道，不受这条会话影响，实测可用）；'
+                '② 到那台设备上退出校园网；③ 等 NAS 自己回收（几分钟到几小时都有）。'
+                '本程序会一直按间隔自动重试' % (USERNAME + DOMAIN))
     if str(result.get('ecode')) == 'E2620':
         return '账号在线设备数已达上限(E2620)，请在自助服务里踢掉其它设备'
     return str(message)
@@ -984,21 +984,40 @@ def clear_stale_sessions():
 _LAST_CONFLICT_REPORT = None
 
 
+def _session_age(add_time):
+    """把在线会话的 add_time 变成「已在线 6 小时 12 分」，用来认出僵尸会话；解析不了返回 ''。"""
+    try:
+        started = time.mktime(time.strptime(str(add_time).strip(), '%Y-%m-%d %H:%M:%S'))
+    except Exception:
+        return ''
+    minutes = int((time.time() - started) / 60)
+    if minutes < 1:
+        return ''
+    if minutes < 60:
+        return '已在线 %d 分钟' % minutes
+    return '已在线 %d 小时 %d 分' % (minutes // 60, minutes % 60)
+
+
 def _report_session_conflict():
     """err_code=2 时把「账号被谁占着」写清楚，并给出下一步该怎么办。
 
     背景（实测）：西电同一账号同一时刻只允许一条在线会话，有线直连 / 网线拨号 / 无线
-    三者共用同一套账号。别的设备（或本机另一条链路）占着账号时，本机的登录会被拒；
-    而刚被踢掉的会话在 NAS 上还要几分钟才真正释放，这期间登录一样会被拒。
+    三者共用同一套账号。别的设备（或本机另一条链路）占着账号时，本机的 Portal 登录会被拒；
+    实测还可能遇到「僵尸会话」：某个 IP 上的会话挂了几小时也不回收（2026-10-03 10:04 那次，
+    10.192.111.213 从 03:55 一直在线），Portal 就一直登不上 —— 但**拨号照样能成**。
+
+    本程序**不做任何「踢设备」动作**（除非界面「高级」里手动勾选），只负责把情况说清楚。
     """
     global _LAST_CONFLICT_REPORT
     entries = []
     try:
         for item in online_sessions():
             ours = item['ip'] in set(local_ipv4_addresses())
-            entries.append('%s%s%s' % (item['ip'],
-                                       '（本机）' if ours else '（其它设备）',
-                                       '·%s' % item['os_name'] if item.get('os_name') else ''))
+            age = _session_age(item.get('add_time') or '')
+            entries.append('%s%s%s%s' % (item['ip'],
+                                         '（本机）' if ours else '（其它设备）',
+                                         '·%s' % item['os_name'] if item.get('os_name') else '',
+                                         '，%s' % age if age else ''))
     except Exception as error:
         debug('查询在线设备失败: %s' % error)
     report = '、'.join(entries) or '在线设备列表为空（NAS 还没释放刚被踢掉的会话）'
@@ -1007,9 +1026,10 @@ def _report_session_conflict():
     _LAST_CONFLICT_REPORT = report
     log('账号 %s 上当前还有在线会话：%s' % (USERNAME + DOMAIN, report))
     if not CLEAR_SESSIONS:
-        log('按默认配置不动这些会话（CLEAR_SESSIONS=False）：是本机的就先停掉那条链路'
-            '（拔网线 / 断开拨号 / 关无线），是别的设备的就到那台设备上退出校园网'
-            '（或去 zfw.xidian.edu.cn 踢掉）；NAS 释放旧会话一般要几分钟，等一会儿会自动恢复')
+        log('本程序不动这些会话（不做任何「踢设备」）。三条出路：'
+            '① 插上网线，让本程序拨号 —— 拨号是另一套认证通道，不受这条旧会话影响（实测可用）；'
+            '② 到那台设备上退出校园网；③ 等 NAS 自己回收（几分钟到几小时都有）。'
+            '本程序会一直按间隔自动重试')
 
 
 def reauth_once():
