@@ -2,12 +2,15 @@
 """界面自检：构造窗口、渲染截图、逐个控件量「文字宽度 vs 控件宽度」。"""
 import os
 import sys
+import ctypes
+from ctypes import wintypes
 
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 sys.path.insert(0, r'e:\code\Auto-xdwlan-main')
 
 from PyQt5 import QtWidgets, QtCore      # noqa: E402
 import app as A                           # noqa: E402
+import autoconn                           # noqa: E402
 
 # 不许打扰正在运行的实例，也不许真去连网
 A.InstanceGuard = type('NoGuard', (QtCore.QObject,), {'__init__': lambda self, parent=None: None,
@@ -62,3 +65,29 @@ for kind, text, need, have in offenders:
 path = os.path.join(os.environ.get('TEMP', '.'), 'ui_v215_full.png')
 win.grab().save(path)
 print('截图: %s' % path)
+
+# ---------- 关机钩子自检（v2.17）：只 stub 掉拨号相关函数，不碰真实网络 ----------
+print()
+print('--- 关机 / 注销钩子 ---')
+events = []
+autoconn.active_dial_connections = lambda: ['宽带连接']
+autoconn.pppoe_hangup = lambda *a, **k: (events.append('hangup'), (True, 'stub 已断开'))[1]
+win._shutdown_hung_up = False
+win.append_log = lambda text: events.append('log:%s' % text)
+
+
+def fake_message(code, repeat=1):
+    for _ in range(repeat):
+        msg = wintypes.MSG()
+        msg.message = code
+        address = ctypes.cast(ctypes.pointer(msg), ctypes.c_void_p).value   # 传地址（和 Qt 一样）
+        win.nativeEvent(b'windows_generic_MSG', address)
+
+
+fake_message(0x0005)        # WM_SIZE：不该触发
+print('普通消息(WM_SIZE) 触发关机动作：%s' % ('是（错！）' if 'hangup' in events else '否（正确）'))
+fake_message(0x0011)        # WM_QUERYENDSESSION：应该断开拨号
+print('WM_QUERYENDSESSION 断开拨号：%s' % ('是（正确）' if 'hangup' in events else '否（错！）'))
+count = events.count('hangup')
+fake_message(0x0016, repeat=3)   # WM_ENDSESSION 重复到达：只该断一次
+print('重复 WM_ENDSESSION 再断次数：%d（正确应为 0）' % (events.count('hangup') - count))

@@ -32,7 +32,7 @@ import autoconn
 
 APP_NAME = 'Auto-xdwlan'
 APP_TITLE = '西电校园网自动连接'
-APP_VERSION = '2.16'
+APP_VERSION = '2.17'
 SETTINGS_FILE = 'settings.json'
 LOCAL_SERVER = 'Auto-xdwlan-gui'
 
@@ -1120,6 +1120,51 @@ class MainWindow(QtWidgets.QMainWindow):
         self.value_net.setToolTip(detail or '—')
         self.tray.setToolTip('%s · %s\n%s%s' % (APP_NAME, self.status_text.text(), route,
                                                ('（出口 %s）' % egress) if egress else ''))
+
+    WM_QUERYENDSESSION = 0x0011
+    WM_ENDSESSION = 0x0016
+
+    def nativeEvent(self, event_type, message):
+        """关机 / 注销前先把拨号挂断（v2.17）。
+
+        原因：Windows 关机时那条 PPPoE 会话经常没被 NAS 及时释放（RasMan 日志里只有「建立」没有
+        「断开」），重启后新拨的这条就和它撞上同一个账号 —— 西电「一号一会话、保留旧的」，
+        于是新会话十几秒后被顶掉（实测 11:00:22 建立 → 11:00:34 断开），得再拨一次才稳。
+        在系统通知我们「要关机了」的时候主动断开，NAS 就能及时把旧会话放掉。
+        只在关机 / 注销时做，程序正常退出（托盘→退出）不动拨号。
+        """
+        try:
+            if event_type in (b'windows_generic_MSG', 'windows_generic_MSG'):
+                import ctypes
+                from ctypes import wintypes
+                # 必须按 wintypes.MSG 的结构取 message（x64 下 hwnd 占 8 字节，
+                # 手动按 4 字节数会读错偏移 —— 踩过一次）
+                if isinstance(message, int):
+                    address = message
+                elif hasattr(message, '__int__'):
+                    address = int(message)          # PyQt5 给的 sip.voidptr
+                else:
+                    address = message.value
+                msg = ctypes.cast(address, ctypes.POINTER(wintypes.MSG)).contents
+                if msg.message in (self.WM_QUERYENDSESSION, self.WM_ENDSESSION):
+                    self._hangup_for_shutdown()
+        except Exception:
+            pass
+        return super().nativeEvent(event_type, message)
+
+    def _hangup_for_shutdown(self):
+        """只做一次，并且必须很快返回（Windows 关机只给几秒）。"""
+        if getattr(self, '_shutdown_hung_up', False):
+            return
+        self._shutdown_hung_up = True
+        try:
+            if autoconn.active_dial_connections():
+                ok, message = autoconn.pppoe_hangup()
+                log_line('系统即将关机 → 已断开拨号：%s' % message)
+            else:
+                log_line('系统即将关机 → 没有需要断开的拨号')
+        except Exception as error:
+            log_line('系统关机前断开拨号失败（不影响关机）：%s' % error)
 
     def set_busy(self, busy, job_name=''):
         self.busy = busy

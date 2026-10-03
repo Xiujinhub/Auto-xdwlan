@@ -46,6 +46,7 @@ def run(name, cable=True, dial_ok=True, wifi_ok=True, login_ok=True,
     autoconn.WIFI_SSID = 'stu-xdwlan'
     autoconn.WIFI_AUTO_CONNECT = True
     autoconn.STOP_REQUESTED = False
+    autoconn.JUST_DROPPED = False
 
     autoconn.log = lambda msg, also_print=True: logs.append(str(msg))
     autoconn.debug = lambda msg: None
@@ -143,9 +144,9 @@ expect('E 已经能上网：什么都不做',
 expect('F 界面里关掉「允许网线拨号」→ 不拨号，走 Wi-Fi',
        0, ['check_internet', 'wifi', 'check_internet'] + HOLD,
        cable=True, pppoe_enable=False, online_after=('wifi',))
-expect('G 拨号刚连上就被掐掉（12 秒那种）→ 自己发现并重拨，直到稳住',
-       0, ['check_internet', 'dial', 'check_internet', 'check_internet',        # 第 1 轮：连上后掉了
-           'check_internet', 'dial', 'check_internet'] + HOLD,                  # 第 2 轮：重拨稳住
+expect('G 拨号刚连上就被掐掉（12 秒那种）→ 自己发现并重拨（且不再重复探测），直到稳住',
+       0, ['check_internet', 'dial', 'check_internet', 'check_internet', 'report',
+           'dial', 'check_internet'] + HOLD,
        cable=True, online_after=('dial',), drop_first_dial=True)
 
 print('结果：%s' % ('全部通过' if not failures else '失败 %s' % failures))

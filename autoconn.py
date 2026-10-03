@@ -73,6 +73,10 @@ def new_session():
 # 界面版点「停止」时会把它置为 True，让重试/等待循环尽快退出
 STOP_REQUESTED = False
 
+# 「刚刚才在观察窗口里掉过线」：下一次重试不用再花十几秒探测「是不是已经能上网」，
+# 直接照人工做法重拨（人工遇到掉线也就是再点一次「连接」）。由 _hold_link() 置位。
+JUST_DROPPED = False
+
 
 # ---------- 读取界面版保存的私有配置（settings.json，不会被提交到仓库） ----------
 
@@ -1709,6 +1713,7 @@ def _hold_link():
     返回 True = 这段时间内外网一直通，本次连接可以算完成；
     返回 False = 中途又断了（调用方应该把拨号 / Wi-Fi / 认证整条流程重来一遍）。
     """
+    global JUST_DROPPED
     deadline = time.time() + LINK_WATCH
     held = 0
     while time.time() < deadline:
@@ -1724,11 +1729,14 @@ def _hold_link():
             debug('已保持联网 %d 秒（%s）' % (held, detail))
             continue
         dials = active_dial_connections()
+        JUST_DROPPED = True          # 下一轮直接重拨，别再花十几秒重复探测
         if dials:
             log('刚连上就又断了（坚持了约 %d 秒）：外网不通，但拨号（%s）还挂着 —— '
                 '多半是 NAS 上的旧会话把这条顶掉了，重来一遍' % (held, '、'.join(dials)))
         else:
             log('刚连上就又断了（坚持了约 %d 秒）：外网不通、拨号也掉线了 —— 立刻重连' % held)
+        # 顺手把「账号上还有谁在线」写进日志：顶掉新会话的通常就是它（旧会话 / 别的设备）
+        _report_session_conflict()
         return False
     log('已连续 %d 秒保持联网，本次连接完成' % LINK_WATCH)
     return True
@@ -1769,11 +1777,18 @@ def auto_connect():
         if STOP_REQUESTED:
             break
 
-        # 第 0 步：已经能上外网 → 什么都不动（人工也不会去点「连接」）
-        connected, detail = check_internet()
-        if connected:
-            log('网络已连通（%s），第 %d 次检查，无需登录' % (detail, attempt))
-            return 0
+        global JUST_DROPPED
+        if JUST_DROPPED:
+            # 刚刚在观察窗口里确认掉过线 → 不用再花十几秒探测「是不是已经能上网」，
+            # 直接照人工做法重拨（人工遇到掉线也就是再点一次「连接」）。
+            JUST_DROPPED = False
+            log('刚刚确认掉线 → 直接重拨，不再重复探测')
+        else:
+            # 第 0 步：已经能上外网 → 什么都不动（人工也不会去点「连接」）
+            connected, detail = check_internet()
+            if connected:
+                log('网络已连通（%s），第 %d 次检查，无需登录' % (detail, attempt))
+                return 0
 
         log('第 %d/%d 轮：按人工做法连接（有线：%s；无线：%s）'
             % (attempt, MAX_RETRY,
