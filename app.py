@@ -32,7 +32,7 @@ import autoconn
 
 APP_NAME = 'Auto-xdwlan'
 APP_TITLE = '西电校园网自动连接'
-APP_VERSION = '2.14'
+APP_VERSION = '2.15'
 SETTINGS_FILE = 'settings.json'
 LOCAL_SERVER = 'Auto-xdwlan-gui'
 
@@ -169,8 +169,6 @@ SETTINGS_DEFAULTS = {
     'wifi_ssid': autoconn.WIFI_SSID,
     'wifi_enable': True,
     'pppoe_enable': True,
-    'pppoe_fallback': True,
-    'clear_sessions': False,
     'pppoe_name': autoconn.PPPOE_NAME,
     'autostart': False,
     'background': True,
@@ -243,16 +241,12 @@ def apply_settings(data):
     autoconn.WIFI_SSID = (data.get('wifi_ssid') or '').strip()
     autoconn.WIFI_AUTO_CONNECT = bool(data.get('wifi_enable'))
     autoconn.PPPOE_ENABLE = bool(data.get('pppoe_enable'))
-    autoconn.PPPOE_FALLBACK = bool(data.get('pppoe_fallback', True))
-    autoconn.CLEAR_SESSIONS = bool(data.get('clear_sessions', False))
-    autoconn.CLEAR_OTHER_DEVICES = False      # 只清「看起来是本机」的会话，不动别人的设备
     autoconn.PPPOE_NAME = (data.get('pppoe_name') or '').strip() or 'XidianPPoE'
     autoconn.PPPOE_USER = ''
     autoconn.PPPOE_PASSWORD = ''
-    autoconn.MAX_RETRY = 8       # 界面里不要长时间卡着（配合「停止」按钮）
-    autoconn.RETRY_INTERVAL = 8
-    autoconn.CONFLICT_WAIT = 300  # 被「已有在线会话」挡住时等 NAS 释放的窗口（可随时「停止」）
-    autoconn.DIAL_GRACE = 20      # 拨号刚连上时留给它的时间（这段时间不做 Portal 认证）
+    autoconn.MAX_RETRY = 8         # 界面里不要长时间卡着（配合「停止」按钮）
+    autoconn.RETRY_INTERVAL = 10   # 每轮之间的间隔：拨号 / 连 Wi-Fi / Portal 都试过之后歇多久
+    autoconn.DIAL_SETTLE = 15      # 拨号成功后留给它验证外网的时间（期间不做 Portal 认证）
     autoconn.REQUEST_TIMEOUT = 8
     autoconn.LOG_FILE = None  # 不写日志文件
 
@@ -889,11 +883,6 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QLineEdit.Normal if shown else QtWidgets.QLineEdit.Password)
         self.show_password_btn.setText('隐藏' if shown else '显示')
 
-    def _toggle_advanced(self, shown):
-        """展开 / 收起「高级」里的两个危险开关。"""
-        self.advanced_box.setVisible(shown)
-        self.advanced_btn.setText('▾ 高级' if shown else '▸ 高级')
-
     def _toggle_log(self, shown):
         """展开 / 收起运行日志（收起后窗口更紧凑，也不再占着剩余空间）。"""
         self.log_view.setVisible(shown)
@@ -954,34 +943,14 @@ class MainWindow(QtWidgets.QMainWindow):
         row3.addWidget(self.interval_spin)
         row3.addWidget(field_label('分钟', 'FieldKey'))
         row3.addStretch(1)
-
-        self.advanced_btn = QtWidgets.QToolButton()
-        self.advanced_btn.setObjectName('Link')
-        self.advanced_btn.setCheckable(True)
-        self.advanced_btn.setText('▸ 高级')
-        self.advanced_btn.setCursor(QtCore.Qt.PointingHandCursor)
-        self.advanced_btn.setToolTip('平时用不到的两个开关（都带风险，默认不动）')
-        self.advanced_btn.toggled.connect(self._toggle_advanced)
-        row3.addWidget(self.advanced_btn)
         card.body.addLayout(row3)
 
-        # 高级选项：默认收起，点「▸ 高级」才展开（主界面保持干净）
-        self.advanced_box = QtWidgets.QWidget()
-        adv = QtWidgets.QVBoxLayout(self.advanced_box)
-        adv.setContentsMargins(0, 2, 0, 0)
-        adv.setSpacing(7)
-        self.fallback_check = QtWidgets.QCheckBox('Portal 被拒时，试一次网线拨号')
-        self.fallback_check.setToolTip('账号被占用（err_code=2）导致 Portal 认证一直失败时，'
-                                       '再用同一个账号试一次 PPPoE 拨号，失败原因会写进日志')
-        self.fallback_check.setChecked(bool(self.settings.get('pppoe_fallback', True)))
-        adv.addWidget(self.fallback_check)
-        self.clear_check = QtWidgets.QCheckBox('会话冲突时清掉旧会话（会把自己也踢下线几分钟）')
-        self.clear_check.setToolTip('默认不勾：账号同一时刻只允许一条在线会话，踢掉后 NAS 要几分钟才释放，'
-                                    '这期间连本机也登不上。只有确认是「僵尸会话」才勾选。')
-        self.clear_check.setChecked(bool(self.settings.get('clear_sessions', False)))
-        adv.addWidget(self.clear_check)
-        self.advanced_box.setVisible(False)
-        card.body.addWidget(self.advanced_box)
+        # 一行说明自动连接的顺序（照人工操作），省得用户猜程序在干什么
+        order = field_label('顺序：插着网线先拨号 → 不行再连 Wi-Fi → 最后才 Portal 认证', 'Hint')
+        order.setWordWrap(True)
+        order.setToolTip('等价于人工操作：打开「拨号」点连接 / 点 Wi-Fi 选校园网 / 打开浏览器登录一次。\n'
+                         '全程不看网卡 IP 是多少，也不做任何「踢设备」的动作')
+        card.body.addWidget(order)
         return card
 
     def _build_log_card(self):
@@ -1290,8 +1259,6 @@ class MainWindow(QtWidgets.QMainWindow):
         data['reconnect_minutes'] = int(self.interval_spin.value())
         data['wifi_enable'] = self.wifi_check.isChecked()
         data['pppoe_enable'] = self.pppoe_check.isChecked()
-        data['pppoe_fallback'] = self.fallback_check.isChecked()
-        data['clear_sessions'] = self.clear_check.isChecked()
         return data
 
     def save_and_apply(self):
