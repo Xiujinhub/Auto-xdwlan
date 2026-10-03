@@ -32,7 +32,7 @@ import autoconn
 
 APP_NAME = 'Auto-xdwlan'
 APP_TITLE = '西电校园网自动连接'
-APP_VERSION = '2.17'
+APP_VERSION = '2.18'
 SETTINGS_FILE = 'settings.json'
 LOCAL_SERVER = 'Auto-xdwlan-gui'
 

@@ -27,20 +27,22 @@ class FakeTime:
 
 
 def run(name, cable=True, dial_ok=True, wifi_ok=True, login_ok=True,
-        online_after=(), already=False, pppoe_enable=True, drop_first_dial=False):
+        online_after=(), already=False, pppoe_enable=True, drop_first_dial=False,
+        max_retry=2, radio_off_first=False):
     calls.clear()
     logs.clear()
-    state = {'connected': already, 'dials': 0, 'drop_at': None}
+    state = {'connected': already, 'dials': 0, 'drop_at': None, 'wifi_calls': 0}
 
     autoconn.time = FakeTime()
     autoconn.USERNAME = '25201111510'
     autoconn.PASSWORD = 'stub'
     autoconn.DOMAIN = ''
-    autoconn.MAX_RETRY = 2
+    autoconn.MAX_RETRY = max_retry
     autoconn.RETRY_INTERVAL = 0
     autoconn.DIAL_SETTLE = 0
     autoconn.LINK_WATCH = 20        # = 2 次检查
     autoconn.LINK_WATCH_STEP = 10
+    autoconn.DIAL_DEAD_ROUNDS_BEFORE_FALLBACK = 3
     autoconn.PPPOE_ENABLE = pppoe_enable
     autoconn.PPPOE_NAME = '宽带连接'
     autoconn.WIFI_SSID = 'stu-xdwlan'
@@ -62,7 +64,7 @@ def run(name, cable=True, dial_ok=True, wifi_ok=True, login_ok=True,
     autoconn.portal_reachable = lambda timeout=None: True
     autoconn._report_session_conflict = lambda: calls.append('report')
 
-    def check_internet():
+    def check_internet(fast=False):
         calls.append('check_internet')
         if state.get('drop_at') == calls.count('check_internet'):
             state['drop_at'] = None           # 模拟「刚连上 12 秒就被 NAS 掐掉」的那一次
@@ -86,6 +88,11 @@ def run(name, cable=True, dial_ok=True, wifi_ok=True, login_ok=True,
         calls.append('wifi')
         if not wifi_ok:
             return False, 'stub 连不上'
+        state['wifi_calls'] += 1
+        if radio_off_first and state['wifi_calls'] == 1:
+            # 第一次连：无线的软件开关被系统关掉了（实测反复出现）
+            return False, ('连接 stu-xdwlan 失败：无线网卡被系统关掉了'
+                           '（netsh 报 0x80342002 = 无线软件开关关着）：请在 Windows 里打开 Wi-Fi 开关')
         if 'wifi' in online_after:
             state['connected'] = True
         return True, '已连接'
@@ -103,6 +110,7 @@ def run(name, cable=True, dial_ok=True, wifi_ok=True, login_ok=True,
     autoconn.pppoe_hangup = lambda *a, **k: (True, 'stub')
     autoconn.connect_wifi = connect_wifi
     autoconn.login = login
+    autoconn.enable_wifi_radio = lambda: (calls.append('radio'), (True, 'stub 无线开关已打开'))[1]
 
     code = autoconn.auto_connect()
     print('== %s ==  动作顺序: %s   返回: %s' % (name, ' -> '.join(calls), code))
@@ -148,6 +156,21 @@ expect('G 拨号刚连上就被掐掉（12 秒那种）→ 自己发现并重拨
        0, ['check_internet', 'dial', 'check_internet', 'check_internet', 'report',
            'dial', 'check_internet'] + HOLD,
        cable=True, online_after=('dial',), drop_first_dial=True)
+# 2026-10-03 11:14 那个坑：拨通了但外网不通 → 旧版会"断开它改走 Wi-Fi/Portal"（结果一条没连上）；
+# 新版必须"再拨一次"，两轮里都不许碰 Wi-Fi / Portal。
+expect('H 拨通了但外网不通 → 只重拨，不去折腾 Wi-Fi / Portal',
+       1, ['check_internet', 'dial', 'check_internet', 'dial', 'check_internet'],
+       cable=True, online_after=(), max_retry=2)
+expect('H2 连续「拨通但无网」满 3 轮 → 才允许改试 Wi-Fi / Portal',
+       1, ['check_internet', 'dial', 'check_internet',                        # 第 1 轮：拨上但无网
+           'dial', 'check_internet',                                          # 第 2 轮：再拨
+           'dial', 'check_internet', 'wifi', 'check_internet', 'login', 'report',   # 第 3 轮：拨满 3 次才换路
+           'check_internet', 'dial', 'check_internet', 'wifi', 'check_internet',
+           'login', 'report'],                                                # 第 4 轮：继续试 Wi-Fi / Portal
+       cable=True, online_after=(), max_retry=4, login_ok=False)
+expect('I 无线软件开关被关掉（0x80342002）→ 自动打开再连一次',
+       0, ['check_internet', 'dial', 'wifi', 'radio', 'wifi', 'check_internet'] + HOLD,
+       cable=True, dial_ok=False, online_after=('wifi',), radio_off_first=True)
 
 print('结果：%s' % ('全部通过' if not failures else '失败 %s' % failures))
 sys.exit(1 if failures else 0)

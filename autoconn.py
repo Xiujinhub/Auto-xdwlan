@@ -174,6 +174,12 @@ PPPOE_DIAL_TIMEOUT = 100     # 单次拨号最长等待秒数
 # 干干净净地改走 Wi-Fi / Portal（两边不要同时抢同一个账号）。
 DIAL_SETTLE = 15
 
+# 「拨通了但外网不通」连续几轮之后，才允许改试 Wi-Fi / Portal（v2.18）。
+# 实测：被账号上旧会话顶掉时，正确的做法就是**再拨一次**（人工也是这么干的），而不是换 Wi-Fi
+# —— 2026-10-03 11:14 那次就是「拨通→不通→断开→连 Wi-Fi（开关关着）→Portal（被僵尸会话挡）」
+# 一条都没连上。真遇到「墙口只给拨号会话、但不给网」的坏口子时，拨满 3 轮就换别的路。
+DIAL_DEAD_ROUNDS_BEFORE_FALLBACK = 3
+
 # ---------- 连上之后再盯一会儿（v2.16）----------
 # 实测（2026-10-03 10:43:54 拨号成功 → 10:44:06 就被断开，只活了 12 秒）：刚重启时 NAS 上
 # 还挂着上一次的旧会话，新拨的这条会被顶掉；这时如果马上报「连接成功」，链接一掉就没人管了
@@ -215,6 +221,11 @@ INTERNET_PROBES = (
 # 目的是：离线时别在探测上耗太久，同时保证至少能试到两三个地址。
 PROBE_TIMEOUT = 5
 PROBE_BUDGET = 12
+
+# 「快速探测」（v2.18）：只试最快的前两个地址（http/https 各一个 miui generate_204）。
+# 给「拨号后验证」和「连上后的观察窗口」用 —— 那里每隔几秒就要探一次，用完整探测太费时间。
+FAST_PROBE_TIMEOUT = 3
+FAST_PROBE_BUDGET = 6
 
 # 日志文件：默认不写文件（None）。日志只输出到控制台，界面版则显示在窗口的「运行日志」里。
 # 想留档时自己赋一个路径即可，例如：autoconn.LOG_FILE = r'D:\tmp\autoconn.log'
@@ -499,7 +510,7 @@ def _probe_internet(url, expect_status, timeout):
             response.close()
 
 
-def check_internet():
+def check_internet(fast=False):
     """探测是否真的能上外网：返回 (是否通, 说明)。
 
     注意：
@@ -507,13 +518,18 @@ def check_internet():
         200/204，还要看状态码是否与探测地址的约定一致、内容是不是 Portal 页；
       * 探测地址有好几个（不同厂商、http/https 都有），只要有一个通就算联网 ——
         单个地址抽风不能当成"断网"，否则会白白把正在用的拨号拆掉重拨；
-      * 一轮探测有时间预算（PROBE_BUDGET），离线时不至于卡很久。
+      * 一轮探测有时间预算（PROBE_BUDGET），离线时不至于卡很久；
+      * fast=True（v2.18）：只试最快的前两个地址、预算更短 —— 给「拨号后验证 / 观察窗口」
+        用。那里每 10 秒就要探一次，用完整探测会一次花掉十几秒（实测拨号后那段总共 70 秒里
+        大半都耗在探测上）。
     """
     global _LAST_PROBE_SUMMARY, _LAST_INTERNET_RESULT
-    deadline = time.time() + PROBE_BUDGET
+    probes = INTERNET_PROBES[:2] if fast else INTERNET_PROBES
+    timeout_cap = FAST_PROBE_TIMEOUT if fast else PROBE_TIMEOUT
+    deadline = time.time() + (FAST_PROBE_BUDGET if fast else PROBE_BUDGET)
     reasons = []
-    for url, expect_status in INTERNET_PROBES:
-        timeout = max(2, min(PROBE_TIMEOUT, deadline - time.time()))
+    for url, expect_status in probes:
+        timeout = max(2, min(timeout_cap, deadline - time.time()))
         ok, reason = _probe_internet(url, expect_status, timeout)
         if ok:
             _LAST_PROBE_SUMMARY = None      # 恢复联网后，下次失败要重新报原因
@@ -529,7 +545,7 @@ def check_internet():
         _LAST_PROBE_SUMMARY = summary
         log('外网探测都没通过：%s' % summary)
     _LAST_INTERNET_RESULT = (False, summary, time.time())
-    return False, '外网不通（%d 个探测地址都没通，原因见运行日志）' % len(INTERNET_PROBES)
+    return False, '外网不通（%d 个探测地址都没通，原因见运行日志）' % len(probes)
 
 
 # 门户域名上次解析到的 IP：用来做「不依赖 DNS」的校园网活性检查
@@ -1616,22 +1632,29 @@ def _manual_dial(round_no):
     """第 1 步（等价人工）：插着网线就打开系统里那条「宽带连接」点连接。
 
     只看「网线插没插」（有线网卡链路 Up），不看网卡拿到的是 10.x 还是 169.254 —— 人工也不看。
-    拨号成功后再等 DIAL_SETTLE 秒验证外网；还是不通就把它断开（同一账号只允许一条在线会话，
-    两边同时抢会把拨号顶掉），让后面的 Wi-Fi / Portal 那一步干净地去做。
 
-    返回 True 表示「已经能上网了」，调用方可以直接结束。
+    返回 (拨号是否建立, 是否已能上网)：
+
+    * ``(False, False)``：没插网线 / 拨号失败（619、628、691…）→ 这条路不通，交给 Wi-Fi / Portal；
+    * ``(True,  True)`` ：拨上并且外网能通 → 成功；
+    * ``(True,  False)``：**拨上了但外网不通** —— 实测就是「被账号上那条旧会话顶掉 / 链路抖动」，
+      人工遇到这种情况也是**再点一次「连接」**，而不是去连 Wi-Fi；
+      v2.18 起调用方会优先「再拨一次」，不再白白把这条链路丢掉。
+
+    （2026-10-03 11:14 的失败日志就是被这里坑的：拨通后外网不通 → 断开 → 去连 Wi-Fi（开关关着失败）
+      → 又去 Portal（被僵尸会话挡住）→ 结果一条都没连上，而其实再拨一次就好了。）
     """
     if not PPPOE_ENABLE or not PPPOE_NAME:
         log('跳过拨号：%s' % ('界面里「允许网线拨号」关闭了' if PPPOE_NAME else '没有配置拨号连接名'))
-        return False
+        return False, False
 
     entries = active_dial_connections()
     if entries:
         # 可能是上次连的 / 用户自己连的：先看能不能上网，能上网就一个字都别动
-        connected, detail = check_internet()
+        connected, detail = check_internet(fast=True)
         if connected:
             log('拨号（%s）已经在线且外网通畅（%s），不用重拨' % ('、'.join(entries), detail))
-            return True
+            return True, True
         log('拨号（%s）在线但外网不通 → 先断开再拨一次（等同人工点「断开」再点「连接」）'
             % '、'.join(entries))
         pppoe_hangup()
@@ -1642,28 +1665,78 @@ def _manual_dial(round_no):
     ok, message = pppoe_dial()
     log('网线拨号：%s' % message)
     if not ok:
-        return False
+        return False, False
 
     # 先立刻看一眼：很多时候拨通就通了，不用白等
-    connected, detail = check_internet()
+    connected, detail = check_internet(fast=True)
     if connected:
         log('拨号后已能上网（%s）' % detail)
-        return True
+        return True, True
     # 还没通就给它 DIAL_SETTLE 秒把链路跑起来
     deadline = time.time() + DIAL_SETTLE
     while not STOP_REQUESTED and time.time() < deadline:
         time.sleep(3)
-        connected, detail = check_internet()
+        connected, detail = check_internet(fast=True)
         if connected:
             log('拨号后已能上网（%s）' % detail)
-            return True
+            return True, True
     if STOP_REQUESTED:
-        return False
-    log('拨号连上了，但 %d 秒内外网还是不通 → 断开它，改走 Wi-Fi / Portal'
-        '（同一账号只允许一条在线会话，两边同时抢会把拨号顶掉）' % DIAL_SETTLE)
+        return True, False
+    log('拨号连上了，但 %d 秒内外网还是不通 —— 多半是被账号上那条旧会话顶掉了；'
+        '下面再拨一次（人工遇到这种情况也是再点一次「连接」）' % DIAL_SETTLE)
     pppoe_hangup()
     time.sleep(2)
-    return False
+    return True, False
+
+
+def enable_wifi_radio():
+    """把被系统关掉的无线「软件开关」打开（等同人工去「设置 → 网络」里打开 Wi-Fi）。
+
+    本机实测这个开关会被反复关掉（Windows 电源管理 / 驱动 / 无线快捷键都可能），
+    被关掉时 `netsh wlan connect` 直接报 0x80342002，怎么重连都没用。
+    这里用 Windows 的 Radio API（WinRT，PowerShell 一行就能调）把它打开。
+    返回 (是否成功, 说明)。
+    """
+    script = (
+        "Add-Type -AssemblyName System.Runtime.WindowsRuntime\n"
+        "$asTaskGeneric = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {\n"
+        "    $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and\n"
+        "    $_.GetParameters()[0].ParameterType.Name -like 'IAsyncOperation*' })[0]\n"
+        "function Await($op, $type) {\n"
+        "    $task = $asTaskGeneric.MakeGenericMethod($type).Invoke($null, @($op))\n"
+        "    $task.Wait(-1) | Out-Null\n"
+        "    $task.Result\n"
+        "}\n"
+        "$radioType = [Windows.Devices.Radios.Radio, Windows.System.Devices, ContentType = WindowsRuntime]\n"
+        "$listType = [System.Collections.Generic.IReadOnlyList[Windows.Devices.Radios.Radio]]\n"
+        "$radios = Await ($radioType::GetRadiosAsync()) $listType\n"
+        "$wifi = $radios | Where-Object { $_.Kind -eq 'WiFi' }\n"
+        "if (-not $wifi) { 'no-wifi-radio'; exit 0 }\n"
+        "\"before=$($wifi.State)\"\n"
+        "$access = Await ($wifi.SetStateAsync([Windows.Devices.Radios.RadioState]::On))"
+        " ([Windows.Devices.Radios.RadioAccessStatus])\n"
+        "\"after=$($wifi.State) access=$access\"\n"
+    )
+    # 走 .ps1 文件，避免 -Command 的引号 / 换行转义坑（PowerShell 5.1 也认）
+    path = os.path.join(tempfile.gettempdir(), 'auto_xdwlan_radio_on.ps1')
+    try:
+        with open(path, 'w', encoding='ascii') as handle:
+            handle.write(script)
+        code, text = _run_command(['powershell', '-NoProfile', '-ExecutionPolicy', 'Bypass',
+                                   '-File', path], timeout=60, encoding='utf-8')
+    except Exception as error:
+        return False, '调用 PowerShell 打开无线开关失败: %s' % error
+    finally:
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+    text = (text or '').strip()
+    if 'no-wifi-radio' in text:
+        return False, '系统里找不到无线设备（网卡被禁用 / 拆掉了？）'
+    if 'after=On' in text:
+        return True, '已把无线的软件开关打开（之前被系统关掉了）'
+    return False, ('无线开关没打开：%s' % (text.splitlines()[-1] if text else '无输出'))[:120]
 
 
 def _manual_wifi(round_no):
@@ -1681,6 +1754,14 @@ def _manual_wifi(round_no):
     log('连 Wi-Fi（等同人工点「%s」，当前%s）…'
         % (WIFI_SSID, '连着 ' + current if current else '未连接'))
     ok, message = connect_wifi(wait=WIFI_CONNECT_WAIT, verbose=True)
+    if not ok and '0x80342002' in message:
+        # 无线软件开关被系统关掉了（本机反复出现）→ 自动打开，然后立刻重连一次
+        log('检测到无线的软件开关被关掉（0x80342002）→ 自动打开它…')
+        fixed, detail = enable_wifi_radio()
+        log('打开无线开关：%s' % detail)
+        if fixed:
+            time.sleep(3)
+            ok, message = connect_wifi(wait=WIFI_CONNECT_WAIT, verbose=True)
     if not ok:
         log('Wi-Fi 连接未成功：%s' % message)
         return False
@@ -1699,7 +1780,7 @@ def _manual_portal(round_no):
         return False
     log('第 %d 轮 Portal 认证：%s' % (round_no, message))
     time.sleep(2)
-    connected, detail = check_internet()
+    connected, detail = check_internet(fast=True)
     if connected:
         log('联网验证通过（%s）' % detail)
         return True
@@ -1724,7 +1805,7 @@ def _hold_link():
         if STOP_REQUESTED:
             return True
         held += LINK_WATCH_STEP
-        connected, detail = check_internet()
+        connected, detail = check_internet(fast=True)
         if connected:
             debug('已保持联网 %d 秒（%s）' % (held, detail))
             continue
@@ -1769,10 +1850,11 @@ def auto_connect():
             % (USERNAME + DOMAIN))
 
     log('本机当前链路：%s' % link_report())
-    online_user = who_is_online(new_session())
-    if online_user:
-        log('Portal 记录显示 %s 已在线' % online_user)
+    # 这里**不再**先查一次「Portal 记录显示谁在线」（v2.18）：断网时那个接口会卡十几秒
+    # （实测 11:13:20 → 11:13:56 那 36 秒里大半是它），而它只是"记录一下"。真需要看时，
+    # 界面上的「在线账号」和 _report_session_conflict() 都会给出。
 
+    dial_dead_rounds = 0      # 连续几次「拨通了但外网不通」
     for attempt in range(1, MAX_RETRY + 1):
         if STOP_REQUESTED:
             break
@@ -1796,18 +1878,34 @@ def auto_connect():
                wifi_current_ssid() or '未连接'))
 
         # 第 1 步：插着网线 → 拨号（连上后先盯一会儿，别「刚连上就被掐掉」还当成功）
-        if PPPOE_ENABLE and ethernet_link_up() and _manual_dial(attempt):
-            if _hold_link():
-                return 0
-            continue
+        if PPPOE_ENABLE and ethernet_link_up():
+            dialed, online = _manual_dial(attempt)
+            if online:
+                if _hold_link():
+                    return 0
+                JUST_DROPPED = True          # 观察窗口里掉的 → 立刻重拨
+                dial_dead_rounds += 1
+                continue
+            if dialed:
+                # 拨上了、但外网不通：拨号这条路本身是通的（多半被账号上旧会话顶掉），
+                # 先别急着换 Wi-Fi / Portal —— 直接再拨一次（人工也是再点一次「连接」）。
+                dial_dead_rounds += 1
+                if dial_dead_rounds < DIAL_DEAD_ROUNDS_BEFORE_FALLBACK:
+                    JUST_DROPPED = True
+                    log('拨号这条路是通的，只是这一下没通 → 马上再拨一次（本轮不再折腾 Wi-Fi / Portal）')
+                    continue
+                log('已经连续 %d 轮「拨通了但外网不通」→ 这次改试 Wi-Fi / Portal' % dial_dead_rounds)
+            else:
+                dial_dead_rounds = 0
 
         # 第 2 步：没插网线 / 拨号没成 → 连 Wi-Fi（连上了先看是不是免认证就能上网）
         if _manual_wifi(attempt):
-            connected, detail = check_internet()
+            connected, detail = check_internet(fast=True)
             if connected:
                 log('Wi-Fi 接入后已能上网（%s），无需登录' % detail)
                 if _hold_link():
                     return 0
+                JUST_DROPPED = True
                 continue
 
         # 第 3 步：还上不了网 → 走一次 Portal 认证（人工就是打开浏览器登录一次）
@@ -1815,6 +1913,7 @@ def auto_connect():
             if _manual_portal(attempt):
                 if _hold_link():
                     return 0
+                JUST_DROPPED = True
                 continue
         else:
             log('门户 %s 现在不可达（无线 / 网线这一层还没通）→ 本轮先不做认证' % PORTAL)
