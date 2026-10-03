@@ -170,6 +170,14 @@ PPPOE_DIAL_TIMEOUT = 100     # 单次拨号最长等待秒数
 # 干干净净地改走 Wi-Fi / Portal（两边不要同时抢同一个账号）。
 DIAL_SETTLE = 15
 
+# ---------- 连上之后再盯一会儿（v2.16）----------
+# 实测（2026-10-03 10:43:54 拨号成功 → 10:44:06 就被断开，只活了 12 秒）：刚重启时 NAS 上
+# 还挂着上一次的旧会话，新拨的这条会被顶掉；这时如果马上报「连接成功」，链接一掉就没人管了
+# （用户只能再点一次「立即连接」）。所以「刚连上」不能算完成：要盯 LINK_WATCH 秒，一掉线
+# 就把拨号 / Wi-Fi / 认证整条流程重来。
+LINK_WATCH = 40        # 盯多久（秒）
+LINK_WATCH_STEP = 10   # 每隔多久看一次外网（秒）
+
 # 单次 HTTP 请求超时（秒）
 REQUEST_TIMEOUT = 10
 
@@ -1695,6 +1703,37 @@ def _manual_portal(round_no):
     return False
 
 
+def _hold_link():
+    """连上之后再盯 LINK_WATCH 秒，确认它不是「刚连上就被掐掉」的那种。
+
+    返回 True = 这段时间内外网一直通，本次连接可以算完成；
+    返回 False = 中途又断了（调用方应该把拨号 / Wi-Fi / 认证整条流程重来一遍）。
+    """
+    deadline = time.time() + LINK_WATCH
+    held = 0
+    while time.time() < deadline:
+        waited = 0
+        while waited < LINK_WATCH_STEP and not STOP_REQUESTED:
+            time.sleep(1)
+            waited += 1
+        if STOP_REQUESTED:
+            return True
+        held += LINK_WATCH_STEP
+        connected, detail = check_internet()
+        if connected:
+            debug('已保持联网 %d 秒（%s）' % (held, detail))
+            continue
+        dials = active_dial_connections()
+        if dials:
+            log('刚连上就又断了（坚持了约 %d 秒）：外网不通，但拨号（%s）还挂着 —— '
+                '多半是 NAS 上的旧会话把这条顶掉了，重来一遍' % (held, '、'.join(dials)))
+        else:
+            log('刚连上就又断了（坚持了约 %d 秒）：外网不通、拨号也掉线了 —— 立刻重连' % held)
+        return False
+    log('已连续 %d 秒保持联网，本次连接完成' % LINK_WATCH)
+    return True
+
+
 def auto_connect():
     """核心逻辑（v2.15「照人工操作」）：只用 Windows 自带的动作，按人工的顺序做一遍。
 
@@ -1741,21 +1780,27 @@ def auto_connect():
                '已插网线' if ethernet_link_up() else '未插网线',
                wifi_current_ssid() or '未连接'))
 
-        # 第 1 步：插着网线 → 拨号
+        # 第 1 步：插着网线 → 拨号（连上后先盯一会儿，别「刚连上就被掐掉」还当成功）
         if PPPOE_ENABLE and ethernet_link_up() and _manual_dial(attempt):
-            return 0
+            if _hold_link():
+                return 0
+            continue
 
         # 第 2 步：没插网线 / 拨号没成 → 连 Wi-Fi（连上了先看是不是免认证就能上网）
         if _manual_wifi(attempt):
             connected, detail = check_internet()
             if connected:
                 log('Wi-Fi 接入后已能上网（%s），无需登录' % detail)
-                return 0
+                if _hold_link():
+                    return 0
+                continue
 
         # 第 3 步：还上不了网 → 走一次 Portal 认证（人工就是打开浏览器登录一次）
         if portal_reachable(timeout=5):
             if _manual_portal(attempt):
-                return 0
+                if _hold_link():
+                    return 0
+                continue
         else:
             log('门户 %s 现在不可达（无线 / 网线这一层还没通）→ 本轮先不做认证' % PORTAL)
 

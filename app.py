@@ -32,7 +32,7 @@ import autoconn
 
 APP_NAME = 'Auto-xdwlan'
 APP_TITLE = '西电校园网自动连接'
-APP_VERSION = '2.15'
+APP_VERSION = '2.16'
 SETTINGS_FILE = 'settings.json'
 LOCAL_SERVER = 'Auto-xdwlan-gui'
 
@@ -643,13 +643,17 @@ class MainWindow(QtWidgets.QMainWindow):
         LOG_BUS.message.connect(self.append_log)
 
         self.status_timer = QtCore.QTimer(self)
-        self.status_timer.setInterval(60 * 1000)
+        self.status_timer.setInterval(30 * 1000)   # v2.16：60 → 30 秒，断网更快被发现
         self.status_timer.timeout.connect(self._auto_refresh)
         self.status_timer.start()
 
         self.reconnect_timer = QtCore.QTimer(self)
         self.reconnect_timer.timeout.connect(self._auto_reconnect)
         self._update_reconnect_timer()
+
+        # v2.16：断网后马上安排一次自动重连（不再傻等那个「每 N 分钟」的定时器）
+        self.next_auto_connect_at = 0.0    # 下一次允许自动重连的最早时刻
+        self.connect_job_auto = False      # 当前这次「连接」是不是自动发起的
 
         QtCore.QTimer.singleShot(200, lambda: self.start_job('check'))
         if self.settings.get('connect_on_start'):
@@ -1129,7 +1133,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._paint_dot(C_ACCENT)
         if job_name == 'connect':
             self.status_text.setText('正在连接…')
-            self.status_sub.setText('正在拨号 / 连接 Wi-Fi / 校园网认证')
+            self.status_sub.setText('正在拨号 / 连接 Wi-Fi / 校园网认证（连上后还会再观察 %d 秒）'
+                                    % getattr(autoconn, 'LINK_WATCH', 40))
         elif job_name == 'check':
             self.status_text.setText('检测中…')
             self.status_sub.setText('正在获取当前网络状态')
@@ -1139,7 +1144,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ---------- 任务调度 ----------
 
-    def start_job(self, job_name, notify=False):
+    def start_job(self, job_name, notify=False, auto=False):
+        if job_name == 'connect':
+            self.connect_job_auto = auto
         if self.busy:
             # 上一个任务还没结束：记下来，等它结束后自动接着跑（开机时的「先检查再连接」就靠这个）
             if job_name != 'check' or not self.pending_job:
@@ -1190,17 +1197,22 @@ class MainWindow(QtWidgets.QMainWindow):
             self.update_status(info)
             if ok:
                 self.hint.setText('网络正常')
+                self.next_auto_connect_at = 0.0     # 网又通了，下次断网可以立刻重连
             else:
                 self.hint.setText('当前无法上网')
+                self._auto_reconnect_soon('检查到断网')
             return
 
         if job_name == 'connect':
             if ok:
                 self.hint.setText('连接成功')
+                self.next_auto_connect_at = time.time() + 30   # 刚连上，别马上又自动折腾
                 self.tray.showMessage(APP_NAME, '校园网已连接，可以正常上网了',
                                       QtWidgets.QSystemTrayIcon.Information, 3000)
             else:
                 self.hint.setText('连接失败，请查看日志')
+                # 自动重连失败 → 5 分钟后再试（别死磕墙口）；手动点的失败 → 1 分钟后
+                self.next_auto_connect_at = time.time() + (300 if self.connect_job_auto else 60)
                 self.tray.showMessage(APP_NAME, '连接失败，请检查账号密码或网络环境',
                                       QtWidgets.QSystemTrayIcon.Warning, 4000)
             QtCore.QTimer.singleShot(400, lambda: self.start_job('check'))
@@ -1227,15 +1239,37 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self.start_job('check')
 
+    def _auto_reconnect_soon(self, reason):
+        """断网后立刻安排一次自动重连（v2.16）。
+
+        以前只有那个「每 N 分钟」的定时器会重连：断网后最多要等 10 分钟，而且 10:43 那次
+        拨号 12 秒就被掐掉、后面的检查发现了也没人重连 —— 用户只能自己点「立即连接」。
+        现在改成：检查发现断网 → 立刻重连；两次自动重连之间至少隔 60 秒（防抖），
+        自动重连失败后 5 分钟内不再自动重试（避免死磕墙口）。
+        """
+        if not self.settings.get('auto_reconnect'):
+            return
+        if self.busy or self.pending_job:
+            return
+        now = time.time()
+        if now < self.next_auto_connect_at:
+            left = int(self.next_auto_connect_at - now)
+            if left > 5:
+                log_line('%s：%d 秒后再自动重连…' % (reason, left))
+            return
+        self.next_auto_connect_at = now + 60
+        log_line('%s → 立刻自动重连…' % reason)
+        self.start_job('connect', auto=True)
+
     def _auto_reconnect(self):
+        """兜底定时器（界面里那个「每 N 分钟」）：正常情况下上面的立即重连已经处理掉了。"""
         if not self.settings.get('auto_reconnect'):
             return
         if self.busy:
             return
         if self.status_info.get('connected'):
             return
-        log_line('自动重连：检查到网络未连通，开始重新连接…')
-        self.start_job('connect')
+        self._auto_reconnect_soon('兜底定时器到点（网络仍未连通）')
 
     def _update_reconnect_timer(self):
         minutes = max(1, int(self.settings.get('reconnect_minutes', 10) or 10))
