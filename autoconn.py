@@ -175,6 +175,18 @@ PPPOE_DIAL_TIMEOUT = 100     # 单次拨号最长等待秒数
 # 但实测这个墙口确实能拨号（rasdial 成功过），所以留一次尝试机会，
 # 失败原因（619 / 628 / 691 等）会原样打进日志，方便判断是「墙口不支持」还是「账号被占用」。
 PPPOE_FALLBACK = True
+# 被 err_code=2 挡住时，一次运行里最多试几次拨号、两次之间至少隔多久（秒）。
+# 挡住登录的那个旧会话往往要几分钟才被 NAS 释放，所以「隔一会儿再拨一次」比「只拨一次」更容易成功。
+PPPOE_TRIES = 3
+PPPOE_RETRY_INTERVAL = 45
+
+# ---------- 「照人工操作」的顺序（v2.13）----------
+# 实测人工的做法最省事：**插着网线就直接拨号**（打开系统里那条「宽带连接」，只填账号密码），
+# 不看 IP、也不去动 Portal 认证；拨号不通（或者没插网线）才去连无线、再走 Portal。
+# 打开这个开关后，auto_connect 的顺序变成：
+#     能上外网就不动 → 插着网线就先拨号 → 拨号不行/没网线就换 Wi-Fi → 最后才 Portal 认证
+# 关掉它就退回旧顺序（先 Portal 认证，被 err_code=2 挡住时才试拨号）。
+PREFER_DIAL = True
 # 拨号刚连上时给它多少秒把链路跑起来。这段时间里**绝不做 Portal 认证**：
 # 同一账号同一时刻只允许一条在线会话，Portal 一登上去，NAS 就会把拨号那条踢掉 ——
 # 实测现象就是「拨号刚连上 11~15 秒又断了」。给完时间还是不通，就把拨号断开、改走 Portal
@@ -1673,6 +1685,23 @@ def pppoe_dial(user=None, password=None, wait=None, name=None):
     return False, last or '没有可用的拨号连接'
 
 
+def _dial_and_verify(grace=None):
+    """拨号 + 等链路起来并验一次外网。返回 (是否已能上网, 说明)。
+
+    给「照人工操作」那条路用：人工拨号后也就是等几秒看看能不能上网，不通就换别的办法。
+    """
+    ok, message = pppoe_dial()
+    if not ok:
+        return False, message
+    deadline = time.time() + (grace or DIAL_GRACE)
+    while not STOP_REQUESTED and time.time() < deadline:
+        time.sleep(3)
+        connected, detail = check_internet()
+        if connected:
+            return True, '拨号后已能上网（%s）' % detail
+    return False, '拨号连上了，但外网仍不通'
+
+
 def pppoe_hangup(name=None):
     """断开拨号连接（不指定就断开所有已连接的拨号）。"""
     targets = [name] if name else active_dial_connections()
@@ -1735,9 +1764,9 @@ def use_wifi(attempt=1):
     #   1) 账号同一时刻只允许一条在线会话 → 有线在线时，无线的认证必然被 Portal 拒（err_code=2）；
     #   2) Windows 默认把流量走有线（网卡跃点更小）→ 就算无线认证上了，流量也还是走有线。
     # 所以这里只把原因写清楚，让用户自己决定（拔网线 / 禁用有线网卡）。
-    if wired_link_is_egress() and campus_link_alive() is True:
-        log('网线这条在用（出口 IP 走有线），而账号只允许一条在线会话 → 不去连无线；'
-            '要让无线真正生效，请拔掉网线，或在「网络连接」里禁用有线网卡')
+    if wired_link_is_egress() and ethernet_has_ipv4():
+        log('有线这条就是本机出口（而且已经拿到可用 IP）→ 不去连无线：账号同一时刻只允许一条'
+            '在线会话，无线也认不上；要让无线真正生效，请拔掉网线，或在「网络连接」里禁用有线网卡')
         return False
     if not ensure_wifi(wait=WIFI_CONNECT_WAIT if attempt == 1 else 15):
         return False
@@ -1889,6 +1918,9 @@ def auto_connect():
     conflict_waited = False      # 是否已经进入「等 NAS 释放旧会话」的等待（只进一次）
     conflict_reported = False    # 是否已把「账号被谁占着」写进日志（同样的内容只写一次）
     dial_grace_done = False       # 是否已经给过「刚连上的拨号」一次不被 Portal 抢账号的机会
+    pppoe_tries = 0               # 本次运行已经试过几次「被拒后改拨号」
+    pppoe_next_at = 0             # 下次允许再试拨号的最早时间（避免连着重拨）
+    conflict_seen = False         # 是否遇到过「账号已有在线会话」被拒（遇到就别再折腾无线）
     for attempt in range(1, MAX_RETRY + 1):
         if STOP_REQUESTED:
             log('已按请求停止本次连接（界面里点了「停止」）')
@@ -1920,10 +1952,32 @@ def auto_connect():
             pppoe_hangup()
             time.sleep(2)
 
+        # 「照人工操作」（PREFER_DIAL）：插着网线就先拨号 —— 人工就是打开「宽带连接」点连接，
+        # 只填账号密码，不看 IP、也不去碰 Portal 认证。拨通并验到外网就直接结束。
+        if (PREFER_DIAL and PPPOE_ENABLE and ethernet_link_up()
+                and not active_dial_connections()
+                and pppoe_tries < PPPOE_TRIES and time.time() >= pppoe_next_at):
+            pppoe_tries += 1
+            pppoe_next_at = time.time() + PPPOE_RETRY_INTERVAL
+            log('插着网线 → 按人工做法先拨号（账号 %s，第 %d/%d 次）…'
+                % (USERNAME + DOMAIN, pppoe_tries, PPPOE_TRIES))
+            dial_connected, dial_detail = _dial_and_verify()
+            if dial_connected:
+                log(dial_detail)
+                return 0
+            log('网线拨号：%s → 换别的办法（Portal 认证 / 无线）' % dial_detail)
+
         # 外网确实不通时，先确认无线连的就是校园网：以前只有「Portal 不可达」那一支会
         # 连 Wi-Fi，于是「无线连在别的网上 / 根本没连无线，但门户仍然可达」时，脚本
         # 永远不会去连 WIFI_SSID（用户只能自己点一下）。这里补上，每轮只做一次。
-        if not wifi_ensured and needs_wifi():
+        # 但两种情况直接跳过：
+        #   * conflict_seen：上一轮登录被拒是「账号已有在线会话」→ 问题不在链路，无线一样认不上；
+        #   * 有线已经拿到可用 IP → 先把有线这条（Portal / 拨号）走完，别一上来就花半分钟连无线
+        #     （实测每次白等 28~45 秒）。真遇到"墙口只给 IP 不给网"的情况，下一轮还有
+        #     attempt>=2 那支会去连无线，所以 v2.4 的行为没丢。
+        wired_link, wired_has_ip, _ = wired_state()
+        wired_ready = wired_link and wired_has_ip
+        if (not wifi_ensured and not conflict_seen and not wired_ready and needs_wifi()):
             wifi_ensured = True
             if use_wifi(attempt):
                 return 0
@@ -1941,12 +1995,17 @@ def auto_connect():
         # 网线这条（有网线、也有可用 IP）试过一轮还是上不去 → 换无线，别一直死磕网线：
         # 不少墙口是坏的、或者只给拨号不给直连，这时真正能用的其实是 Wi-Fi。
         # （没有网线 / 网线没拿到可用 IP 的情况，上面那一支已经会去连 Wi-Fi 了）
-        if not wifi_tried and attempt >= 2:
+        # 但如果上一轮已经确认是「账号已有在线会话」被拒（conflict_seen），链路本身没毛病，
+        # 连无线也认不上，就直接跳过 —— 否则每轮白等 28~45 秒（实测）。
+        if not wifi_tried and attempt >= 2 and not conflict_seen:
             wifi_tried = True
             if ethernet_link_up() and ethernet_has_ipv4():
                 log('网线这条试过还是上不去 → 改用 Wi-Fi（%s）' % WIFI_SSID)
                 if use_wifi(attempt):
                     return 0
+        elif attempt >= 2 and conflict_seen and not wifi_tried:
+            wifi_tried = True
+            log('上一轮是「账号已有在线会话」被拒 → 跳过连无线（无线也会被同一个会话挡住）')
 
         ok, message = login()
         if ok:
@@ -1977,6 +2036,7 @@ def auto_connect():
         conflict = any(key in message for key in
                        ('code=2', '已在线', 'ip_already_online', '旧会话'))
         if conflict:
+            conflict_seen = True
             # login() 里刚探过一次外网（遇到「已有在线会话」时必须先确认外网通不通），
             # 这里直接复用那个结果；以前会再整轮探一遍，离线时每轮最多 12 秒白等。
             connected, detail = last_internet_result() or check_internet()
@@ -1991,8 +2051,27 @@ def auto_connect():
                 pppoe_done = pppoe_done or dial
                 if recover_link(attempt, dial=dial):
                     return 0
-            # 第一步（非破坏性）：挡路的旧会话要等 NAS 释放（一般几分钟）。这期间像用户手动
-            # 反复点「登录」那样：每隔 RETRY_INTERVAL 探一次外网、试一次登录，直到 CONFLICT_WAIT 秒。
+            # 先把「账号被谁占着」写清楚（同样内容只写一次），再决定动作
+            if not conflict_reported:
+                conflict_reported = True
+                _report_session_conflict()
+            # 有线在手时**先试一次网线拨号**：拨号（PPPoE）和 Portal 是两套认证通道，
+            # Portal 被拒（账号已有在线会话）时拨号往往能成（实测多次成功）。
+            # v2.11 起这一步提到「等 NAS 释放」之前 —— 以前排在 300 秒等待后面，
+            # 用户等到一半按「停止」就永远等不到拨号，看起来就是「软件不会自己拨号」。
+            if (PPPOE_ENABLE and PPPOE_FALLBACK and ethernet_link_up()
+                    and pppoe_tries < PPPOE_TRIES and time.time() >= pppoe_next_at):
+                pppoe_tries += 1
+                pppoe_next_at = time.time() + PPPOE_RETRY_INTERVAL
+                log('Portal 被拒（账号已有在线会话）→ 试一次网线拨号（PPPoE，走另一套认证）'
+                    '（第 %d/%d 次）…' % (pppoe_tries, PPPOE_TRIES))
+                dial_ok, dial_message = _dial_and_verify()
+                if dial_ok:
+                    log(dial_message)
+                    return 0
+                log('网线拨号：%s' % dial_message)
+            # 再等 NAS 释放旧会话（非破坏性）：像用户手动反复点「登录」那样，每隔
+            # RETRY_INTERVAL 探一次外网、试一次登录，直到 CONFLICT_WAIT 秒。
             # **不去踢会话** —— 实测踢掉本机自己的会话后，本机也要跟着掉线几分钟，反而更慢
             # （v2.6 曾经自动踢，实测更糟，v2.7 改成只等不踢）。
             if not conflict_waited:
@@ -2019,7 +2098,7 @@ def auto_connect():
                     log('已按请求停止本次连接（界面里点了「停止」）')
                     return 1
                 log('等了 %d 秒 NAS 还没释放旧会话，继续按正常间隔重试' % CONFLICT_WAIT)
-            # 第二步：还是被拒 → 按「在线设备」列表清旧会话（勾了 CLEAR_SESSIONS 才做）
+            # 最后一步（可选，界面里勾了 CLEAR_SESSIONS 才做）：按「在线设备」列表清旧会话
             if CLEAR_SESSIONS and not kicked:
                 kicked = True
                 # 拨号还连着、而且校园网这一段是活的（门户按 IP 能应答）→ 说明问题不在
@@ -2039,25 +2118,6 @@ def auto_connect():
                             log('清理旧会话后已能上网（%s）' % detail)
                             return 0
                         continue
-            elif not CLEAR_SESSIONS and not conflict_reported:
-                # 默认不动这些会话（见文件开头 CLEAR_SESSIONS 的说明）：先把「账号被谁占着」
-                # 写清楚，再按间隔等 NAS 自己释放。
-                conflict_reported = True
-                _report_session_conflict()
-                # 有线在手的话，顺手试一次网线拨号：拨号与 Portal 共用同一套账号，
-                # 但换个认证通道，说不定能通（实测这个墙口能拨号）。只试一次，
-                # 失败就把 rasdial 的错误码原样报出来。
-                if PPPOE_ENABLE and PPPOE_FALLBACK and not pppoe_done and ethernet_link_up():
-                    pppoe_done = True
-                    log('Portal 一直被拒（账号已有在线会话）→ 试一次网线拨号（PPPoE，同一套账号）…')
-                    dial_ok, dial_message = pppoe_dial()
-                    log('网线拨号：%s' % dial_message)
-                    if dial_ok:
-                        time.sleep(3)
-                        connected, detail = check_internet()
-                        if connected:
-                            log('拨号后已能上网（%s），无需 Portal 认证' % detail)
-                            return 0
 
         if attempt < MAX_RETRY:
             time.sleep(RETRY_INTERVAL)
